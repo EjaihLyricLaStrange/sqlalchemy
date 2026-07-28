@@ -2331,7 +2331,9 @@ class PGCompiler(compiler.SQLCompiler):
         return f"power{self.function_argspec(fn)}"
 
     def visit_sequence(self, seq, **kw):
-        return "nextval('%s')" % self.preparer.format_sequence(seq)
+        return "nextval(%s)" % self.preparer._format_sequence_string_literal(
+            seq
+        )
 
     def limit_clause(self, select, **kw):
         text = ""
@@ -3204,8 +3206,42 @@ class PGTypeCompiler(compiler.GenericTypeCompiler):
         return "JSONPATH"
 
 
+class _CompilerSequence:
+    """Minimal stand-in for :class:`.Sequence`.
+
+    Used for the implicit sequence behind a SERIAL column, where no
+    :class:`.Sequence` object exists but a name still has to be rendered
+    through :meth:`.IdentifierPreparer.format_sequence`.
+
+    """
+
+    __slots__ = ("name", "schema")
+
+    # the schema handed to us has already been resolved against the
+    # schema translate map, so don't let format_sequence() translate it
+    # a second time
+    _use_schema_map = False
+
+    def __init__(self, name, schema=None):
+        self.name = name
+        self.schema = schema
+
+
 class PGIdentifierPreparer(compiler.IdentifierPreparer):
     reserved_words = RESERVED_WORDS
+
+    def _format_sequence_string_literal(self, sequence):
+        """Render a sequence name as a SQL string literal.
+
+        ``nextval()`` and friends take the sequence as a string rather than
+        as an identifier, so the quoted identifier produced by
+        :meth:`.format_sequence` has to be escaped a second time for the
+        enclosing literal.
+
+        """
+        return "'%s'" % self.format_sequence(
+            sequence, use_schema=True
+        ).replace("'", "''")
 
     def _unquote_identifier(self, value):
         if value[0] == self.initial_quote:
@@ -3408,8 +3444,8 @@ class PGExecutionContext(default.DefaultExecutionContext):
     def fire_sequence(self, seq, type_):
         return self._execute_scalar(
             (
-                "select nextval('%s')"
-                % self.identifier_preparer.format_sequence(seq)
+                "select nextval(%s)"
+                % self.identifier_preparer._format_sequence_string_literal(seq)
             ),
             type_,
         )
@@ -3446,13 +3482,12 @@ class PGExecutionContext(default.DefaultExecutionContext):
                 else:
                     effective_schema = None
 
-                if effective_schema is not None:
-                    exc = 'select nextval(\'"%s"."%s"\')' % (
-                        effective_schema,
-                        seq_name,
+                exc = (
+                    "select nextval(%s)"
+                    % self.identifier_preparer._format_sequence_string_literal(
+                        _CompilerSequence(seq_name, effective_schema)
                     )
-                else:
-                    exc = "select nextval('\"%s\"')" % (seq_name,)
+                )
 
                 return self._execute_scalar(exc, column.type)
 
@@ -3871,9 +3906,11 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
         return pg_class_table.c.relkind == sql.any_(_array.array(relkinds))
 
     @lru_cache()
-    def _has_table_query(self, schema):
+    def _has_multi_table_query(self, schema):
         query = select(pg_catalog.pg_class.c.relname).where(
-            pg_catalog.pg_class.c.relname == bindparam("table_name"),
+            pg_catalog.pg_class.c.relname.in_(
+                bindparam("table_names", expanding=True)
+            ),
             self._pg_class_relkind_condition(
                 pg_catalog.RELKINDS_ALL_TABLE_LIKE
             ),
@@ -3884,9 +3921,18 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
 
     @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kw):
+        # NOTE: it's not worth calling into the multi table since the query
+        # is compatible also with this single case.
         self._ensure_has_table_connection(connection)
-        query = self._has_table_query(schema)
-        return bool(connection.scalar(query, {"table_name": table_name}))
+        query = self._has_multi_table_query(schema)
+        return bool(connection.scalar(query, {"table_names": [table_name]}))
+
+    def has_multi_table(self, connection, table_names, schema=None, **kw):
+        query = self._has_multi_table_query(schema)
+        params = {"table_names": table_names}
+        existing = set(connection.scalars(query, params).all())
+        retval = {(schema, table): table in existing for table in table_names}
+        return retval.items()
 
     @reflection.cache
     def has_sequence(self, connection, sequence_name, schema=None, **kw):
