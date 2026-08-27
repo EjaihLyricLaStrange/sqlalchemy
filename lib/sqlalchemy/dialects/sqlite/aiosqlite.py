@@ -76,6 +76,11 @@ based on the kind of SQLite database that's requested:
     may be used by specifying it via the
     :paramref:`_sa.create_engine.poolclass` parameter.
 
+As with the pysqlite dialect, this selection is made based on the database
+name alone, and the ``mode=memory`` query string argument is deprecated as
+a means of influencing it; see :ref:`pysqlite_threading_pooling` for
+background.
+
 .. _aiosqlite_memory:
 
 Using a Memory Database with Multiple Coroutines
@@ -101,6 +106,12 @@ Because this URL form is treated as a file-based database by the dialect,
 :class:`.AsyncAdaptedQueuePool` is used automatically and no additional
 configuration is needed.
 
+Note that a shared-cache database is discarded once its last connection is
+closed, so that operations such as :meth:`_asyncio.AsyncEngine.dispose` or
+the use of :paramref:`_sa.create_engine.pool_recycle` will destroy its
+contents; see :ref:`pysqlite_shared_cache_lifespan` for background and for
+how to hold such a database open.
+
 See the pysqlite documentation at
 :ref:`pysqlite_uri_shared_cache` for full details on shared-cache memory
 databases, including how to use named databases to maintain multiple
@@ -124,6 +135,7 @@ from typing import Union
 from .base import SQLiteExecutionContext
 from .pysqlite import SQLiteDialect_pysqlite
 from ... import pool
+from ... import util
 from ...connectors.asyncio import AsyncAdapt_dbapi_connection
 from ...connectors.asyncio import AsyncAdapt_dbapi_cursor
 from ...connectors.asyncio import AsyncAdapt_dbapi_module
@@ -316,11 +328,22 @@ class SQLiteDialect_aiosqlite(SQLiteDialect_pysqlite):
             __import__("aiosqlite"), __import__("sqlite3")
         )
 
+    def retrieve_dbapi_version(self, dbapi: DBAPIModule) -> util.VersionInfo:
+        # the version of aiosqlite, rather than the Python version
+        # reported by the pysqlite dialect
+        aiosqlite = getattr(dbapi, "aiosqlite", None)
+        return util.parse_version_string(
+            getattr(aiosqlite, "__version__", None)
+        )
+
     @classmethod
     def get_pool_class(cls, url: URL) -> type[pool.Pool]:
         if cls._is_url_file_db(url):
             return pool.AsyncAdaptedQueuePool
         else:
+            cls._warn_memory_mode_pool_selection(
+                url, pool.StaticPool, pool.AsyncAdaptedQueuePool
+            )
             return pool.StaticPool
 
     def is_disconnect(

@@ -3,10 +3,6 @@ import decimal
 import importlib
 import operator
 import os
-import pickle
-import subprocess
-import sys
-from tempfile import mkstemp
 import uuid
 
 import sqlalchemy as sa
@@ -97,6 +93,7 @@ from sqlalchemy.testing import is_not
 from sqlalchemy.testing import is_true
 from sqlalchemy.testing import mock
 from sqlalchemy.testing import pickleable
+from sqlalchemy.testing import unpickle_in_subprocess
 from sqlalchemy.testing.assertions import expect_raises_message
 from sqlalchemy.testing.schema import Column
 from sqlalchemy.testing.schema import pep435_enum
@@ -778,27 +775,12 @@ class PickleTypesTest(fixtures.TestBase):
         meta = MetaData()
         Table("foo", meta, column_type)
 
+        code = (
+            "import sqlalchemy; import pickle; import sys; "
+            "pickle.load(open(sys.argv[1], 'rb'))"
+        )
         for target in column_type, meta:
-            f, name = mkstemp("pkl")
-            with os.fdopen(f, "wb") as f:
-                pickle.dump(target, f)
-
-            name = name.replace(os.sep, "/")
-            code = (
-                "import sqlalchemy; import pickle; "
-                f"pickle.load(open('''{name}''', 'rb'))"
-            )
-            parts = list(sys.path)
-            if os.environ.get("PYTHONPATH"):
-                parts.append(os.environ["PYTHONPATH"])
-            pythonpath = os.pathsep.join(parts)
-            proc = subprocess.run(
-                [sys.executable, "-c", code],
-                env={**os.environ, "PYTHONPATH": pythonpath},
-                stderr=subprocess.PIPE,
-            )
-            eq_(proc.returncode, 0, proc.stderr.decode(errors="replace"))
-            os.unlink(name)
+            unpickle_in_subprocess(target, code)
 
 
 class _UserDefinedTypeFixture:
@@ -3649,7 +3631,7 @@ class ExpressionTest(
         (lambda c1: c1.like("qpr"), "q LIKE :q_1->BINDCAST->[TEXT]"),
         (
             lambda c2: c2.like("qpr"),
-            'q LIKE :q_1->BINDCAST->[TEXT COLLATE "xyz"]',
+            "q LIKE :q_1->BINDCAST->[TEXT COLLATE xyz]",
         ),
         (
             # new behavior, a type with no collation passed into collate()
@@ -3657,11 +3639,11 @@ class ExpressionTest(
             # on the right side bind-cast. previous to #11576 we'd only
             # get TEXT for the bindcast.
             lambda c1: collate(c1, "abc").like("qpr"),
-            '(q COLLATE abc) LIKE :param_1->BINDCAST->[TEXT COLLATE "abc"]',
+            "(q COLLATE abc) LIKE :param_1->BINDCAST->[TEXT COLLATE abc]",
         ),
         (
             lambda c2: collate(c2, "abc").like("qpr"),
-            '(q COLLATE abc) LIKE :param_1->BINDCAST->[TEXT COLLATE "abc"]',
+            "(q COLLATE abc) LIKE :param_1->BINDCAST->[TEXT COLLATE abc]",
         ),
         argnames="testcase,expected",
     )
@@ -3706,7 +3688,7 @@ class ExpressionTest(
         )
         self.assert_compile(
             c2.like("qpr"),
-            'q LIKE :q_1->BINDCAST->[TEXT COLLATE "xyz"]',
+            "q LIKE :q_1->BINDCAST->[TEXT COLLATE xyz]",
             dialect=renders_bind_cast,
         )
 
@@ -4168,6 +4150,31 @@ class CompileTest(fixtures.TestBase, AssertsCompiledSQL):
     def test_string_collation(self):
         self.assert_compile(
             String(50, collation="FOO"), 'VARCHAR(50) COLLATE "FOO"'
+        )
+
+    def test_string_collation_lowercase_unquoted(self):
+        """simple lowercase collation names no longer render with
+        unconditional quoting now that this renders via
+        format_collation(). #9693"""
+        self.assert_compile(
+            String(50, collation="foo"), "VARCHAR(50) COLLATE foo"
+        )
+
+    def test_string_collation_schema(self):
+        self.assert_compile(
+            String(50, collation="foo", collation_schema="MySchema"),
+            'VARCHAR(50) COLLATE "MySchema".foo',
+            dialect="postgresql",
+        )
+
+    def test_string_collation_schema_requires_collation(self):
+        assert_raises_message(
+            exc.ArgumentError,
+            "the 'collation_schema' parameter of String requires "
+            "the 'collation' parameter to also be present",
+            String,
+            50,
+            collation_schema="myschema",
         )
 
     def test_char_plain(self):

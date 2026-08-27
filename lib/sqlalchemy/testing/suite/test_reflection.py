@@ -2901,6 +2901,94 @@ class ComponentReflectionTestExtra(ComparesIndexes, fixtures.TestBase):
             ],
         )
 
+    def _cc_by_name(self, reflected, name):
+        """return the sqltext for the named CHECK constraint."""
+
+        for rec in reflected:
+            if rec["name"] == name:
+                return rec["sqltext"]
+
+        assert False, (
+            f"No CHECK constraint named {name!r} in "
+            f"{[rec['name'] for rec in reflected]}"
+        )
+
+    @testing.requires.check_constraint_reflection
+    @testing.combinations(
+        # Regression for #13157: independent sibling parens must not be
+        # treated as if they wrap the whole expression.
+        "(x IS NULL OR y IS NULL) AND (x IS NULL OR y IS NULL)",
+        # Parentheses inside string literals must not throw off the
+        # paren counter.
+        "a = '(' AND b = ')'",
+        # Doubled '' inside a quoted literal is the SQL single-quote
+        # escape.
+        "a = 'it''s'",
+        # Redundant nested parens around a boolean expression.
+        "((((x > 0))))",
+        # Parenthesized sub-expressions.
+        "((x > 1) AND (x < 5))",
+        # Plain expression, no outer parens.
+        "x > 0",
+        argnames="expression",
+    )
+    def test_check_constraint_parenthesized_expressions(
+        self, metadata, inspect_for_table, expression
+    ):
+        """Regression test for #13157.
+
+        A CHECK constraint expression must round-trip through reflection
+        without its parentheses being incorrectly stripped.  The bug
+        greedily paired the leading ``(`` with the trailing ``)`` and
+        dropped both, producing an unbalanced, syntactically invalid
+        expression such as ``x IS NULL OR y IS NULL) AND (x IS NULL OR
+        y IS NULL``.
+        """
+        with inspect_for_table("sa_cc") as (schema, inspector):
+            Table(
+                "sa_cc",
+                metadata,
+                Column("id", Integer(), primary_key=True),
+                Column("x", Integer()),
+                Column("y", Integer()),
+                Column("a", String(50)),
+                Column("b", String(50)),
+                sa.CheckConstraint(expression, name="cc_expr"),
+                schema=schema,
+            )
+
+        reflected = inspector.get_check_constraints("sa_cc", schema=schema)
+
+        # some DBs like Oracle may create additional CHECK constraints
+        # implicitly, so locate ours by name
+
+        reflected_text = self._cc_by_name(reflected, "cc_expr")
+
+        # since different DBs normalize differently, e.g. postgresql
+        # collapses redundant parens, Oracle returns the whole expression
+        # inside of additional parens, MySQL has different quotes, etc.
+        # create a new table + CHECK constraint with our reflected text,
+        # then assert that this new constraint reflects identically to the
+        # original, proving that the database represents both the original
+        # constraint and the reflected text identically.
+        with inspect_for_table("sa_cc_2") as (schema, inspector):
+            Table(
+                "sa_cc_2",
+                metadata,
+                Column("id", Integer(), primary_key=True),
+                Column("x", Integer()),
+                Column("y", Integer()),
+                Column("a", String(50)),
+                Column("b", String(50)),
+                sa.CheckConstraint(reflected_text, name="cc_expr_2"),
+                schema=schema,
+            )
+
+        reflected2 = inspector.get_check_constraints("sa_cc_2", schema=schema)
+
+        reflected_text_2 = self._cc_by_name(reflected2, "cc_expr_2")
+        eq_(reflected_text, reflected_text_2)
+
     @testing.requires.indexes_check_column_order
     def test_index_column_order(self, metadata, inspect_for_table):
         """test for #12894"""
@@ -3575,6 +3663,141 @@ class CompositeKeyReflectionTest(fixtures.TablesTest):
         eq_(fkey1.get("constrained_columns"), ["pname", "pid", "pattr"])
 
 
+class RepeatedColumnForeignKeyTest(fixtures.TestBase):
+    """round trip a FOREIGN KEY which names the same column more than
+    once, e.g. ``FOREIGN KEY (a, a) REFERENCES r (b, c)``.
+
+    """
+
+    __requires__ = ("foreign_key_constraint_reflection",)
+    __backend__ = True
+
+    @testing.fixture
+    @testing.requires.repeated_column_foreign_keys
+    def rep_fk_t(self, connection, metadata):
+        """a table with a FOREIGN KEY that repeats a local column."""
+
+        t = Table(
+            "rep_fk_t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("cid", Integer, nullable=False),
+            sa.UniqueConstraint("id", "cid"),
+            sa.ForeignKeyConstraint(
+                ["cid", "cid"],
+                ["rep_fk_t.id", "rep_fk_t.cid"],
+                name="fk_rep_cid",
+            ),
+            test_needs_fk=True,
+        )
+        metadata.create_all(connection)
+        return t
+
+    @testing.fixture
+    @testing.requires.repeated_remote_col_foreign_keys
+    def remote_fk_t(self, connection, metadata, rep_fk_t):
+        """a table with a FOREIGN KEY that repeats a remote column."""
+
+        t = Table(
+            "remote_fk_t",
+            metadata,
+            Column("id", Integer, primary_key=True),
+            Column("cid", Integer, nullable=False),
+            sa.UniqueConstraint("id", "cid"),
+            sa.ForeignKeyConstraint(
+                ["id", "cid"],
+                ["rep_fk_t.id", "rep_fk_t.id"],
+                name="fk_remote_cid",
+            ),
+            test_needs_fk=True,
+        )
+        metadata.create_all(connection)
+        return t
+
+    def _exp_fk(self, **kw):
+        """an expected ``get_foreign_keys()`` entry.
+
+        ``comment`` is only present for dialects that reflect constraint
+        comments.
+
+        """
+        exp = dict(referred_schema=None, options={}, **kw)
+        if testing.requires.constraint_comment_reflection.enabled:
+            exp["comment"] = None
+        return exp
+
+    def test_get_foreign_keys_local_repeated(self, connection, rep_fk_t):
+        insp = inspect(connection)
+        fkeys = insp.get_foreign_keys("rep_fk_t")
+        eq_(
+            fkeys,
+            [
+                self._exp_fk(
+                    name="fk_rep_cid",
+                    constrained_columns=["cid", "cid"],
+                    referred_table="rep_fk_t",
+                    referred_columns=["id", "cid"],
+                )
+            ],
+        )
+
+    def test_get_foreign_keys_remote_repeated(self, connection, remote_fk_t):
+        insp = inspect(connection)
+        fkeys = insp.get_foreign_keys("remote_fk_t")
+        eq_(
+            fkeys,
+            [
+                self._exp_fk(
+                    name="fk_remote_cid",
+                    constrained_columns=["id", "cid"],
+                    referred_table="rep_fk_t",
+                    referred_columns=["id", "id"],
+                )
+            ],
+        )
+
+    def test_reflect_constraint_local_repeated(self, connection, rep_fk_t):
+        t = Table("rep_fk_t", MetaData(), autoload_with=connection)
+
+        fkcs = [
+            const
+            for const in t.constraints
+            if isinstance(const, sa.ForeignKeyConstraint)
+        ]
+
+        eq_(len(fkcs), 1)
+        fkc = fkcs[0]
+
+        eq_(fkc.column_keys, ["cid", "cid"])
+        eq_(list(fkc.columns), [t.c.cid, t.c.cid])
+        eq_(
+            [(fk.parent, fk.column) for fk in fkc.elements],
+            [(t.c.cid, t.c.id), (t.c.cid, t.c.cid)],
+        )
+
+    def test_reflect_constraint_remote_repeated(self, connection, remote_fk_t):
+        t = Table("remote_fk_t", MetaData(), autoload_with=connection)
+
+        fkcs = [
+            const
+            for const in t.constraints
+            if isinstance(const, sa.ForeignKeyConstraint)
+        ]
+
+        eq_(len(fkcs), 1)
+        fkc = fkcs[0]
+
+        # the referred table is reflected into the same MetaData
+        remote = t.metadata.tables["rep_fk_t"]
+
+        eq_(fkc.column_keys, ["id", "cid"])
+        eq_(list(fkc.columns), [t.c.id, t.c.cid])
+        eq_(
+            [(fk.parent, fk.column) for fk in fkc.elements],
+            [(t.c.id, remote.c.id), (t.c.cid, remote.c.id)],
+        )
+
+
 __all__ = (
     "ComponentReflectionTest",
     "ComponentReflectionTestExtra",
@@ -3587,5 +3810,6 @@ __all__ = (
     "ComputedReflectionTest",
     "IdentityReflectionTest",
     "CompositeKeyReflectionTest",
+    "RepeatedColumnForeignKeyTest",
     "TempTableElementsTest",
 )

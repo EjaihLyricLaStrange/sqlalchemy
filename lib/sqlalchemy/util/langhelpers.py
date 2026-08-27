@@ -16,6 +16,7 @@ from __future__ import annotations
 import collections
 import enum
 from functools import update_wrapper
+import importlib.metadata
 import importlib.util
 import inspect
 import itertools
@@ -306,9 +307,19 @@ def decorator(target: Callable[..., Any]) -> Callable[[_Fn], _Fn]:
         if inspect.iscoroutinefunction(fn):
             metadata["prefix"] = "async "
             metadata["target_prefix"] = "await "
+            metadata["target_suffix"] = ""
+        elif inspect.isgeneratorfunction(fn):
+            # a generator function has to remain a generator function
+            # after decoration; tools such as pytest fixtures test for
+            # inspect.isgeneratorfunction() and will otherwise never
+            # iterate the function at all
+            metadata["prefix"] = ""
+            metadata["target_prefix"] = "(yield from "
+            metadata["target_suffix"] = ")"
         else:
             metadata["prefix"] = ""
             metadata["target_prefix"] = ""
+            metadata["target_suffix"] = ""
 
         # look for __ positional arguments.  This is a convention in
         # SQLAlchemy that arguments should be passed positionally
@@ -321,12 +332,12 @@ def decorator(target: Callable[..., Any]) -> Callable[[_Fn], _Fn]:
         if "__" in repr(spec[0]):
             code = """\
 %(prefix)sdef %(name)s%(grouped_args)s:
-    return %(target_prefix)s%(target)s(%(fn)s, %(apply_pos)s)
+    return %(target_prefix)s%(target)s(%(fn)s, %(apply_pos)s)%(target_suffix)s
 """ % metadata
         else:
             code = """\
 %(prefix)sdef %(name)s%(grouped_args)s:
-    return %(target_prefix)s%(target)s(%(fn)s, %(apply_kw)s)
+    return %(target_prefix)s%(target)s(%(fn)s, %(apply_kw)s)%(target_suffix)s
 """ % metadata
 
         env: Dict[str, Any] = {
@@ -2128,6 +2139,99 @@ def wrap_callable(wrapper, fn):
         return _f
 
 
+def find_matching_paren(text: str, start: int = 0) -> Optional[int]:
+    """Return the index of the ``)`` that matches the ``(`` at ``start``.
+
+    The walk skips single-quoted (``'...'``) and double-quoted (``"..."``)
+    string literals, so parentheses inside string literals do not affect
+    the depth counter. ``''`` and ``""`` are treated as escaped quotes
+    inside their respective contexts, matching PostgreSQL/SQLite literal
+    conventions.
+
+    Returns ``None`` if the opening parenthesis is never closed
+    (unbalanced).  The character at ``text[start]`` must be ``(``.
+
+    Note for SQLite use, SQLite also supports MySQL backtick-style quotes as
+    well as SQL Server bracket style quotes; the latter has different escaping
+    behaviors.  A follow-up patch could add support for these two additional
+    styles (consider using an enum like QuotingStyle.DOUBLE |
+    QuotingStyle.BRACKET, etc.)
+
+    E.g.::
+
+        >>> find_matching_paren("(a + b)")
+        6
+        >>> find_matching_paren("((a)(b))")
+        7
+        >>> find_matching_paren("(a = '(' AND b = ')')")
+        20
+
+    """
+    assert text[start] == "(", "start index must point at an open paren"
+
+    depth = 0
+    in_single = False
+    in_double = False
+    n = len(text)
+    i = start
+    while i < n:
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    i += 2
+                    continue
+                in_single = False
+        elif in_double:
+            if ch == '"':
+                if i + 1 < n and text[i + 1] == '"':
+                    i += 2
+                    continue
+                in_double = False
+        elif ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def strip_outer_parens(text: str) -> str:
+    """Remove one layer of outer parentheses from ``text`` if they wrap the
+    entire (stripped) string.
+
+    Whitespace is preserved if the parentheses do not wrap the whole
+    expression. String literals are honored via :func:`find_matching_paren`,
+    so ``"(a = '(' AND b = ')')"`` correctly strips to
+    ``"a = '(' AND b = ')'"`` rather than being interpreted as two separate
+    paren groups.
+
+    E.g.::
+
+        >>> strip_outer_parens("(a IS NOT NULL)")
+        'a IS NOT NULL'
+        >>> strip_outer_parens("(a) AND (b)")
+        '(a) AND (b)'
+        >>> strip_outer_parens("a NOT NULL")
+        'a NOT NULL'
+
+    """
+    stripped = text.strip()
+    lstripped = len(stripped)
+    if lstripped < 2 or stripped[0] != "(" or stripped[-1] != ")":
+        return text
+    close = find_matching_paren(stripped, 0)
+    if close is not None and close == lstripped - 1:
+        return stripped[1:-1]
+    return text
+
+
 def quoted_token_parser(value):
     """Parse a dotted identifier with accommodation for quoted names.
 
@@ -2313,6 +2417,268 @@ def load_uncompiled_module(module: _M) -> _M:
     assert py_spec.loader
     py_spec.loader.exec_module(py_module)
     return cast(_M, py_module)
+
+
+_pre_release_normalize = {
+    "a": "a",
+    "alpha": "a",
+    "b": "b",
+    "beta": "b",
+    "c": "rc",
+    "pre": "rc",
+    "preview": "rc",
+    "rc": "rc",
+}
+
+_version_string_re = re.compile(
+    r"""
+    \s*
+    (?:[a-z][a-z0-9]*[-_])?                       # ignored prefix, "py3-"
+    v?
+    (?P<release>\d+(?:\.\d+)*)
+    (?:                                           # pre-release
+        [-_.]?
+        (?P<pre_l>alpha|beta|preview|pre|rc|a|b|c)
+        [-_.]?
+        (?P<pre_n>\d+)?
+    )?
+    (?:                                           # post-release
+        [-_.]?
+        (?P<post_l>post|rev|r)
+        [-_.]?
+        (?P<post_n>\d+)?
+    )?
+    (?:                                           # developmental release
+        [-_.]?
+        (?P<dev_l>dev)
+        [-_.]?
+        (?P<dev_n>\d+)?
+    )?
+    """,
+    re.X | re.I,
+)
+
+_VersionSortKey = Tuple[
+    Tuple[int, ...],
+    Tuple[int, str, int],
+    Tuple[int, int],
+    Tuple[int, int],
+]
+
+
+def _version_sort_key(
+    release: Tuple[int, ...],
+    pre: Optional[Tuple[str, int]],
+    post: Optional[int],
+    dev: Optional[int],
+) -> _VersionSortKey:
+    if pre is None and post is None and dev is not None:
+        # a dev release with no other qualifiers precedes every
+        # pre-release of the same release number
+        pre_key = (-1, "", 0)
+    elif pre is None:
+        pre_key = (1, "", 0)
+    else:
+        pre_key = (0, pre[0], pre[1])
+
+    return (
+        release,
+        pre_key,
+        (0, 0) if post is None else (1, post),
+        (1, 0) if dev is None else (0, dev),
+    )
+
+
+def _version_comparison(
+    op: Callable[[Any, Any], bool],
+) -> Callable[[VersionInfo, Any], Any]:
+    """Build one of :class:`.VersionInfo`'s comparison methods.
+
+    Comparison takes place against the sort key rather than the tuple
+    itself, so that pre-release and similar qualifiers are taken into
+    account.  A plain tuple is interpreted as the release segment of a
+    final release; anything else is not comparable.
+
+    """
+
+    def compare(self: VersionInfo, other: Any) -> Any:
+        if isinstance(other, VersionInfo):
+            other_key = other._sort_key
+        elif isinstance(other, tuple):
+            other_key = _version_sort_key(other, None, None, None)
+        else:
+            return NotImplemented
+        return op(self._sort_key, other_key)
+
+    return compare
+
+
+class VersionInfo(Tuple[int, ...]):
+    """A version number, as a tuple of integers.
+
+    :class:`.VersionInfo` is a ``tuple`` subclass consisting of the
+    numeric "release" segment of a version only, e.g. ``2.0.0rc1``
+    is the tuple ``(2, 0, 0)``.  Ordering however takes any
+    pre-release, post-release and developmental qualifiers into account
+    as described by :pep:`440`, so that ``2.0.0rc1`` compares as less than
+    ``2.0.0``, including when compared against a plain tuple such as
+    ``(2, 0, 0)``.
+
+    Plain tuples are interpreted as final releases when compared against
+    a :class:`.VersionInfo`.
+
+    .. versionadded:: 2.1
+
+    """
+
+    string: Optional[str]
+    """the string from which this version was parsed, if any."""
+
+    pre: Optional[Tuple[str, int]]
+    """normalized pre-release qualifier, e.g. ``("rc", 1)``."""
+
+    post: Optional[int]
+    """post-release number, if any."""
+
+    dev: Optional[int]
+    """developmental release number, if any."""
+
+    _sort_key: _VersionSortKey
+
+    def __new__(
+        cls,
+        release: Sequence[int] = (),
+        *,
+        string: Optional[str] = None,
+        pre: Optional[Tuple[str, int]] = None,
+        post: Optional[int] = None,
+        dev: Optional[int] = None,
+    ) -> VersionInfo:
+        # __new__ is needed as the release segment has to be passed to
+        # tuple.__new__(); the remaining state is set up in __init__
+        return tuple.__new__(cls, release)
+
+    def __init__(
+        self,
+        release: Sequence[int] = (),
+        *,
+        string: Optional[str] = None,
+        pre: Optional[Tuple[str, int]] = None,
+        post: Optional[int] = None,
+        dev: Optional[int] = None,
+    ):
+        self.string = string
+        self.pre = pre
+        self.post = post
+        self.dev = dev
+        self._sort_key = _version_sort_key(tuple(self), pre, post, dev)
+
+    def __repr__(self) -> str:
+        if self.string is not None:
+            return f"VersionInfo({tuple(self)!r}, string={self.string!r})"
+        else:
+            return f"VersionInfo({tuple(self)!r})"
+
+    def __str__(self) -> str:
+        if self.string is not None:
+            return self.string
+        else:
+            return ".".join(str(num) for num in self)
+
+    # every comparison has to be stated explicitly; ``tuple`` implements
+    # all six of them, so ``functools.total_ordering`` fills in nothing
+    # here and the ones left out would silently compare as plain tuples
+    __eq__ = _version_comparison(operator.eq)
+    __ne__ = _version_comparison(operator.ne)
+    __lt__ = _version_comparison(operator.lt)
+    __le__ = _version_comparison(operator.le)
+    __gt__ = _version_comparison(operator.gt)
+    __ge__ = _version_comparison(operator.ge)
+
+    def __hash__(self) -> int:
+        return hash(self._sort_key)
+
+
+def parse_version_string(version: Optional[str]) -> VersionInfo:
+    """Parse a DBAPI version string into a :class:`.VersionInfo`.
+
+    Leading characters that are not part of the version itself are
+    ignored, as are trailing characters following the version, so that
+    strings such as ``"py3-4.0.19-beta4"`` and
+    ``"2.9.10 (dt dec pq3 ext lo64)"`` parse correctly.
+
+    An empty :class:`.VersionInfo` is returned if no version number can be
+    located at all.
+
+    Parsing is deliberately more tolerant than that of :pep:`440`, which
+    the version strings published by DBAPIs frequently do not conform to;
+    a strict implementation such as that of the ``packaging`` library
+    rejects each of the above outright.
+
+    .. versionadded:: 2.1
+
+    """
+
+    if not version:
+        return VersionInfo((), string=version)
+
+    m = _version_string_re.match(version)
+    if m is None:
+        return VersionInfo((), string=version)
+
+    release = tuple(int(x) for x in m.group("release").split("."))
+
+    pre_l = m.group("pre_l")
+    pre: Optional[Tuple[str, int]]
+    if pre_l is not None:
+        pre = (
+            _pre_release_normalize[pre_l.lower()],
+            int(m.group("pre_n") or 0),
+        )
+    else:
+        pre = None
+
+    return VersionInfo(
+        release,
+        string=version,
+        pre=pre,
+        post=(
+            int(m.group("post_n") or 0)
+            if m.group("post_l") is not None
+            else None
+        ),
+        dev=(
+            int(m.group("dev_n") or 0)
+            if m.group("dev_l") is not None
+            else None
+        ),
+    )
+
+
+def parse_version_from_metadata(distribution: str) -> VersionInfo:
+    """Return the version of an installed distribution as a
+    :class:`.VersionInfo`.
+
+    This is intended for use by dialects whose DBAPI module does not
+    itself publish a version number, such as ``asyncmy``.  As the
+    distribution name is not necessarily the same as the module name, and
+    the installed distribution is not necessarily the module that was
+    imported, this should not be used when the DBAPI module provides a
+    version of its own.
+
+    An empty :class:`.VersionInfo` is returned if the distribution is not
+    installed.
+
+    .. versionadded:: 2.1
+
+    """
+
+    try:
+        version = importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return VersionInfo()
+    else:
+        return parse_version_string(version)
 
 
 class _Missing(enum.Enum):

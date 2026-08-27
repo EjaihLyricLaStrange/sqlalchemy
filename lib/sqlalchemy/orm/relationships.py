@@ -47,7 +47,6 @@ from typing import Union
 import weakref
 
 from . import attributes
-from . import strategy_options
 from ._typing import insp_is_aliased_class
 from ._typing import is_has_collection_adapter
 from .base import _DeclarativeMapped
@@ -67,6 +66,7 @@ from .interfaces import ONETOMANY
 from .interfaces import PropComparator
 from .interfaces import RelationshipDirection
 from .interfaces import StrategizedProperty
+from .path_registry import _RELATIONSHIP_TOKEN
 from .util import CascadeOptions
 from .. import exc as sa_exc
 from .. import Exists
@@ -358,7 +358,7 @@ class RelationshipProperty(
 
     """
 
-    strategy_wildcard_key = strategy_options._RELATIONSHIP_TOKEN
+    strategy_wildcard_key = _RELATIONSHIP_TOKEN
     inherit_cache = True
     """:meta private:"""
 
@@ -1913,14 +1913,24 @@ class RelationshipProperty(
         if (
             self._attribute_options.dataclasses_default_factory
             is not _NoArg.NO_ARG
-            and self._attribute_options.dataclasses_default_factory
-            is not self.collection_class
         ):
-            raise sa_exc.ArgumentError(
-                f"For relationship {self._format_as_string(cls, key)} using "
-                "dataclass options, default_factory must be exactly "
-                f"{self.collection_class}"
+            # write only / dynamic relationships have no collection_class,
+            # however they accept a list of objects when assigned, so
+            # ``list`` is the expected default_factory for these
+            expected_default_factory = (
+                list if is_write_only or is_dynamic else self.collection_class
             )
+
+            if (
+                self._attribute_options.dataclasses_default_factory
+                is not expected_default_factory
+            ):
+                raise sa_exc.ArgumentError(
+                    "For relationship "
+                    f"{self._format_as_string(cls, key)} using "
+                    "dataclass options, default_factory must be exactly "
+                    f"{expected_default_factory}"
+                )
 
     @util.preload_module("sqlalchemy.orm.mapper")
     def _setup_entity(self, __argument: Any = None, /) -> None:

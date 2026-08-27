@@ -1113,7 +1113,9 @@ class SQLCoreOperations(Generic[_T_co], ColumnOperators, TypingOnly):
 
         def nullslast(self) -> UnaryExpression[_T_co]: ...
 
-        def collate(self, collation: str) -> CollationClause: ...
+        def collate(
+            self, collation: str, collation_schema: Optional[str] = None
+        ) -> CollationClause: ...
 
         def between(
             self, cleft: Any, cright: Any, symmetric: bool = False
@@ -4502,7 +4504,9 @@ class _OverrideBinds(Grouping[_T]):
             for bp in existing_bps
         )
 
-        return ck
+        # ck derives from _gen_cache_key, a compiled function in
+        # _cache_key_cy that mypy sees as untyped
+        return ck  # type: ignore[no-any-return]
 
 
 _FrameIntTuple = tuple[int | None, int | None]
@@ -5627,13 +5631,17 @@ class CollationClause(ColumnElement[str]):
     __visit_name__ = "collation"
 
     _traverse_internals: _TraverseInternalsType = [
-        ("collation", InternalTraversal.dp_string)
+        ("collation", InternalTraversal.dp_string),
+        ("collation_schema", InternalTraversal.dp_string),
     ]
 
     @classmethod
     @util.preload_module("sqlalchemy.sql.sqltypes")
     def _create_collation_expression(
-        cls, expression: _ColumnExpressionArgument[str], collation: str
+        cls,
+        expression: _ColumnExpressionArgument[str],
+        collation: str,
+        collation_schema: Optional[str] = None,
     ) -> BinaryExpression[str]:
 
         sqltypes = util.preloaded.sql_sqltypes
@@ -5641,19 +5649,22 @@ class CollationClause(ColumnElement[str]):
         expr = coercions.expect(roles.ExpressionElementRole[str], expression)
 
         if expr.type._type_affinity is sqltypes.String:
-            collate_type = expr.type._with_collation(collation)
+            collate_type = expr.type._with_collation(
+                collation, collation_schema
+            )
         else:
             collate_type = expr.type
 
         return BinaryExpression(
             expr,
-            CollationClause(collation),
+            CollationClause(collation, collation_schema),
             operators.collate,
             type_=collate_type,
         )
 
-    def __init__(self, collation):
+    def __init__(self, collation, collation_schema=None):
         self.collation = collation
+        self.collation_schema = collation_schema
 
 
 class _IdentifiedClause(Executable, ClauseElement):
@@ -5963,6 +5974,12 @@ class conv(_truncated_label):
 # compiler
 _generated_label = _truncated_label
 _anonymous_label_escape = re.compile(r"[%\(\) \$]+")
+# for bind parameter keys, additionally escape the characters that
+# SQLCompiler.bindname_escape_characters would otherwise escape only at
+# compile time, after the uniquifying counter has already been applied.
+# escaping them up front is what allows names like "a.b" and "a_b" to be
+# disambiguated as "a_b_1" / "a_b_2" rather than colliding.  see #13534
+_bind_key_escape = re.compile(r"[%\(\) \$\.\[\]:]+")
 
 
 class _anonymous_label(_truncated_label):
@@ -5977,11 +5994,13 @@ class _anonymous_label(_truncated_label):
     ) -> typing_Tuple[_anonymous_label, str]:
         # need to escape chars that interfere with format
         # strings in any case, issue #8724
-        body = _anonymous_label_escape.sub("_", body)
-
         if sanitize_key:
-            # sanitize_key is then an extra step used by BindParameter
-            body = body.strip("_")
+            # sanitize_key is an extra step used by BindParameter, which
+            # also escapes the characters that would otherwise be escaped
+            # only at compile time; issue #13534
+            body = _bind_key_escape.sub("_", body).strip("_")
+        else:
+            body = _anonymous_label_escape.sub("_", body)
 
         key = f"{seed} {body.replace('%', '%%')}"
         label = _anonymous_label(f"%({key})s")
@@ -5993,11 +6012,13 @@ class _anonymous_label(_truncated_label):
     ) -> _anonymous_label:
         # need to escape chars that interfere with format
         # strings in any case, issue #8724
-        body = _anonymous_label_escape.sub("_", body)
-
         if sanitize_key:
-            # sanitize_key is then an extra step used by BindParameter
-            body = body.strip("_")
+            # sanitize_key is an extra step used by BindParameter, which
+            # also escapes the characters that would otherwise be escaped
+            # only at compile time; issue #13534
+            body = _bind_key_escape.sub("_", body).strip("_")
+        else:
+            body = _anonymous_label_escape.sub("_", body)
 
         return _anonymous_label(f"%({seed} {body.replace('%', '%%')})s")
 

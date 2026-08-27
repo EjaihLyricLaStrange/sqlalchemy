@@ -470,6 +470,7 @@ SQLAlchemy type (or a subclass of such).
 
 from __future__ import annotations
 
+import collections
 import decimal
 import json
 import random
@@ -550,8 +551,86 @@ class _OracleJson(JSON):
             return process
 
         else:
-            # for JSON, json decoder is set as an outputtypehandler
+            # not BLOB; the value is decoded by an outputtypehandler
+            # rather than here.  see _cx_oracle_outputtypehandler() below
             return None
+
+    def _cx_oracle_outputtypehandler(self, dialect):
+        """Establish an outputtypehandler for JSON result columns.
+
+        The dialect makes use of two distinct outputtypehandlers.  One is
+        connection-wide, set up by the dialect's
+        _generate_connection_outputtype_handler(); it sees every column of
+        every statement and knows nothing of SQLAlchemy-side types, only of
+        the DBAPI type the database reports.  The other is the one returned
+        here, which the execution context's
+        _generate_cursor_outputtype_handler() installs on the cursor for one
+        particular statement, and which applies only to those result columns
+        that SQLAlchemy knows to be of JSON type.
+
+        The two do not compose.  The driver consults the cursor's handler if
+        one is present, and the connection's otherwise, never both.  The
+        cursor-level handler assembled by the execution context therefore
+        delegates to the connection-level handler explicitly for the columns
+        it has no handler of its own for, and the DB_TYPE_JSON case below
+        has to repeat what the connection-level handler does rather than
+        defer to it.
+
+        """
+
+        if self._should_use_blob(dialect):
+            # BLOB is decoded by result_processor() instead
+            return None
+
+        cx_Oracle = dialect.dbapi
+        json_deserializer = dialect._json_deserializer
+
+        def handler(cursor, name, default_type, size, precision, scale):
+            if default_type is cx_Oracle.DB_TYPE_JSON:
+                # a native JSON column.  the driver decodes these into
+                # Python objects on its own, so a handler is only needed in
+                # order to route the value through a user-supplied
+                # deserializer, receiving it as text to do so.  this repeats
+                # the connection-level handler, as noted above
+                if json_deserializer is not None:
+                    return cursor.var(
+                        cx_Oracle.DB_TYPE_VARCHAR,
+                        _CX_ORACLE_MAX_JSON_CONVERTED,
+                        cursor.arraysize,
+                        outconverter=json_deserializer,
+                    )
+                else:
+                    return None
+            elif default_type in (
+                cx_Oracle.DB_TYPE_VARCHAR,
+                cx_Oracle.DB_TYPE_NVARCHAR,
+                cx_Oracle.DB_TYPE_LONG,
+                cx_Oracle.DB_TYPE_LONG_NVARCHAR,
+            ):
+                # a JSON-typed expression that isn't a native JSON column,
+                # such as a bound parameter or a string expression selected
+                # directly.  the database reports it as ordinary character
+                # data and won't decode it, so decode it here.  the
+                # connection-level handler can't do this as it has no way to
+                # know the expression was intended as JSON
+                return cursor.var(
+                    default_type,
+                    size,
+                    cursor.arraysize,
+                    outconverter=json_deserializer or json.loads,
+                    **dialect._cursor_var_unicode_kwargs,
+                )
+            elif default_type in (cx_Oracle.CLOB, cx_Oracle.NCLOB):
+                # same as the character case above, except the database
+                # reports the expression as a LOB; read it as a string
+                # first, then decode
+                return dialect._cursor_lob_as_str_var(
+                    cursor, default_type, json_deserializer or json.loads
+                )
+            else:
+                return None
+
+        return handler
 
 
 class _OracleInteger(sqltypes.Integer):
@@ -966,27 +1045,40 @@ class OracleExecutionContext_cx_oracle(OracleExecutionContext):
                         )
 
     def _generate_cursor_outputtype_handler(self):
-        output_handlers = {}
+        assert isinstance(self.compiled, OracleCompiler)
 
-        for keyname, name, objects, type_ in self.compiled._result_columns:
-            handler = type_._cached_custom_processor(
+        # accumulate handlers positionally
+        handlers = [
+            type_._cached_custom_processor(
                 self.dialect,
                 "cx_oracle_outputtypehandler",
                 self._get_cx_oracle_type_handler,
             )
+            for _, _, _, type_ in self.compiled._result_columns
+        ]
 
-            if handler:
-                denormalized_name = self.dialect.denormalize_name(keyname)
-                output_handlers[denormalized_name] = handler
+        if not any(handlers):
+            return
 
-        if output_handlers:
-            default_handler = self._dbapi_connection.outputtypehandler
+        # a handler on the cursor replaces the connection-wide handler
+        # outright rather than adding to it, so keep a reference to the
+        # latter and delegate to it for columns we have no handler for
+        default_handler = self._dbapi_connection.outputtypehandler
+
+        if self.compiled._textual_ordered_columns:
+            # for a textual construct with positional columns, i.e.
+            # text().columns() / tstring().columns(), match handlers
+            # positionally instead of by name, since names are not
+            # deterministic. See #13479
+
+            handler_queue = collections.deque(handlers)
 
             def output_type_handler(
                 cursor, name, default_type, size, precision, scale
             ):
-                if name in output_handlers:
-                    return output_handlers[name](
+                handler = handler_queue.popleft() if handler_queue else None
+                if handler is not None:
+                    return handler(
                         cursor, name, default_type, size, precision, scale
                     )
                 else:
@@ -994,7 +1086,27 @@ class OracleExecutionContext_cx_oracle(OracleExecutionContext):
                         cursor, name, default_type, size, precision, scale
                     )
 
-            self.cursor.outputtypehandler = output_type_handler
+        else:
+            output_handlers = {
+                self.dialect.denormalize_name(rc[0]): handler
+                for rc, handler in zip(self.compiled._result_columns, handlers)
+                if handler
+            }
+
+            def output_type_handler(
+                cursor, name, default_type, size, precision, scale
+            ):
+                handler = output_handlers.get(name)
+                if handler is not None:
+                    return handler(
+                        cursor, name, default_type, size, precision, scale
+                    )
+                else:
+                    return default_handler(
+                        cursor, name, default_type, size, precision, scale
+                    )
+
+        self.cursor.outputtypehandler = output_type_handler
 
     def _get_cx_oracle_type_handler(self, impl):
         if hasattr(impl, "_cx_oracle_outputtypehandler"):
@@ -1109,6 +1221,8 @@ class OracleDialect_cx_oracle(OracleDialect):
 
     bind_typing = interfaces.BindTyping.SETINPUTSIZES
 
+    minimum_dbapi_version = util.VersionInfo((8,))
+
     driver = "cx_oracle"
 
     colspecs = util.update_copy(
@@ -1170,7 +1284,6 @@ class OracleDialect_cx_oracle(OracleDialect):
             self.colspecs[sqltypes.UnicodeText] = _OracleUnicodeTextNCLOB
 
         dbapi_module = self.dbapi
-        self._load_version(dbapi_module)
 
         if dbapi_module is not None:
             # these constants will first be seen in SQLAlchemy datatypes
@@ -1200,19 +1313,19 @@ class OracleDialect_cx_oracle(OracleDialect):
 
             self._paramval = lambda value: value.getvalue()
 
-    def _load_version(self, dbapi_module):
-        version = (0, 0, 0)
-        if dbapi_module is not None:
-            m = re.match(r"(\d+)\.(\d+)(?:\.(\d+))?", dbapi_module.version)
-            if m:
-                version = tuple(
-                    int(x) for x in m.group(1, 2, 3) if x is not None
-                )
-        self.cx_oracle_ver = version
-        if self.cx_oracle_ver < (8,) and self.cx_oracle_ver > (0, 0, 0):
-            raise exc.InvalidRequestError(
-                "cx_Oracle version 8 and above are supported"
-            )
+    def retrieve_dbapi_version(self, dbapi):
+        return util.parse_version_string(getattr(dbapi, "version", None))
+
+    @property
+    def cx_oracle_ver(self):
+        """Legacy accessor for :attr:`.Dialect.dbapi_version`.
+
+        Retained for backwards compatibility; ``(0, 0, 0)`` is returned
+        when no version can be determined.
+
+        """
+        version = self._dbapi_version_or_none
+        return version if version is not None else util.VersionInfo((0, 0, 0))
 
     @classmethod
     def import_dbapi(cls):
@@ -1341,9 +1454,40 @@ class OracleDialect_cx_oracle(OracleDialect):
 
     _to_decimal = decimal.Decimal
 
+    def _cursor_lob_as_str_var(self, cursor, default_type, outconverter=None):
+        """Produce a ``cursor.var()`` that receives a CLOB / NCLOB as a
+        string.
+
+        Used both by the connection-wide outputtypehandler and by
+        type-level handlers such as that of :class:`._OracleJson`, which
+        need the LOB contents as a string in order to decode them further.
+
+        """
+        cx_Oracle = self.dbapi
+
+        kw = self._cursor_var_unicode_kwargs
+        if outconverter is not None:
+            kw = {**kw, "outconverter": outconverter}
+
+        return cursor.var(
+            (
+                cx_Oracle.DB_TYPE_VARCHAR
+                if default_type is cx_Oracle.CLOB
+                else cx_Oracle.DB_TYPE_NVARCHAR
+            ),
+            _CX_ORACLE_MAGIC_LOB_SIZE,
+            cursor.arraysize,
+            **kw,
+        )
+
     def _generate_connection_outputtype_handler(self):
         """establish the default outputtypehandler established at the
         connection level.
+
+        note that when using a Compiled statement that has types (e.g.
+        TypeEngine), we set up a per-cursor handler instead which supercedes
+        this one, using Oracle-specific TypeEngine handlers delivered by the
+        _cx_oracle_outputtypehandler() method of each one.
 
         """
 
@@ -1407,17 +1551,7 @@ class OracleDialect_cx_oracle(OracleDialect):
                 cx_Oracle.CLOB,
                 cx_Oracle.NCLOB,
             ):
-                typ = (
-                    cx_Oracle.DB_TYPE_VARCHAR
-                    if default_type is cx_Oracle.CLOB
-                    else cx_Oracle.DB_TYPE_NVARCHAR
-                )
-                return cursor.var(
-                    typ,
-                    _CX_ORACLE_MAGIC_LOB_SIZE,
-                    cursor.arraysize,
-                    **dialect._cursor_var_unicode_kwargs,
-                )
+                return dialect._cursor_lob_as_str_var(cursor, default_type)
 
             elif dialect.auto_convert_lobs and default_type in (
                 cx_Oracle.BLOB,

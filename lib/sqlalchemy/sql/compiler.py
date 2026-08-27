@@ -1346,6 +1346,12 @@ class SQLCompiler(Compiled):
     """
 
     escaped_bind_names: util.immutabledict[str, str] = util.EMPTY_DICT
+
+    # the names ``escaped_bind_names`` maps *to*, maintained alongside it so
+    # that collision checks don't rebuild the value collection each time.
+    # only assigned once a name actually needs escaping, which is rare;
+    # ``escaped_bind_names`` being empty means this was never set.
+    _escaped_bind_names_used: Set[str]
     """Late escaping of bound parameter names that has to be converted
     to the original name when looking in the parameter dictionary.
 
@@ -2743,7 +2749,9 @@ class SQLCompiler(Compiled):
             return schema_prefix + self.preparer.quote(tablename) + "." + name
 
     def visit_collation(self, element, **kw):
-        return self.preparer.format_collation(element.collation)
+        return self.preparer.format_collation(
+            element.collation, element.collation_schema
+        )
 
     def visit_fromclause(self, fromclause, **kwargs):
         return fromclause.name
@@ -4163,6 +4171,44 @@ class SQLCompiler(Compiled):
     def _anonymize(self, name: str) -> str:
         return name % self.anon_map
 
+    def _escaped_bind_name(self, escaped_from: str, name: str) -> str:
+        """Record the escaped form of a bind name, uniquifying it against
+        the names already in use.
+
+        Distinct bind names can escape to the same string, e.g. parameters
+        named ``"a.b"`` and ``"a_b"`` both escape to ``a_b``.  As the escaped
+        name is what keys the parameter dictionary handed to the driver, the
+        second parameter would otherwise overwrite the first and its value be
+        silently discarded.  A counter is appended so that the two remain
+        distinct.  The ``.key`` of each :class:`.BindParameter` is untouched,
+        so parameter dictionaries passed by the caller are unaffected.
+
+        See :ticket:`13534`.
+
+        """
+        try:
+            return self.escaped_bind_names[escaped_from]
+        except KeyError:
+            pass
+
+        if self.escaped_bind_names:
+            used = self._escaped_bind_names_used
+        else:
+            self._escaped_bind_names_used = used = set()
+
+        if name in used or (name != escaped_from and name in self.binds):
+            base = name
+            counter = 0
+            while name in used or name in self.binds:
+                counter += 1
+                name = "%s__%d" % (base, counter)
+
+        used.add(name)
+        self.escaped_bind_names = self.escaped_bind_names.union(
+            {escaped_from: name}
+        )
+        return name
+
     def bindparam_string(
         self,
         name: str,
@@ -4194,11 +4240,16 @@ class SQLCompiler(Compiled):
                 )
                 escaped_from = name
                 name = new_name
+            elif (
+                self.escaped_bind_names
+                and name in self._escaped_bind_names_used
+            ):
+                # this name needs no escaping of its own, but another
+                # parameter has already escaped to it; #13534
+                escaped_from = name
 
         if escaped_from:
-            self.escaped_bind_names = self.escaped_bind_names.union(
-                {escaped_from: name}
-            )
+            name = self._escaped_bind_name(escaped_from, name)
         if post_compile:
             ret = "__[POSTCOMPILE_%s]" % name
             if expanding:
@@ -7698,33 +7749,69 @@ class GenericTypeCompiler(TypeCompiler):
         return "NCLOB"
 
     def _render_string_type(
-        self, name: str, length: Optional[int], collation: Optional[str]
+        self,
+        name: str,
+        length: Optional[int],
+        collation: Optional[str],
+        collation_schema: Optional[str] = None,
+        identifier_preparer: Optional[IdentifierPreparer] = None,
+        **kw: Any,
     ) -> str:
         text = name
         if length:
             text += f"({length})"
         if collation:
-            text += f' COLLATE "{collation}"'
+            if identifier_preparer is None:
+                identifier_preparer = self.dialect.identifier_preparer
+            text += " COLLATE " + identifier_preparer.format_collation(
+                collation, collation_schema
+            )
         return text
 
     def visit_CHAR(self, type_: sqltypes.CHAR, **kw: Any) -> str:
-        return self._render_string_type("CHAR", type_.length, type_.collation)
+        return self._render_string_type(
+            "CHAR",
+            type_.length,
+            type_.collation,
+            type_.collation_schema,
+            **kw,
+        )
 
     def visit_NCHAR(self, type_: sqltypes.NCHAR, **kw: Any) -> str:
-        return self._render_string_type("NCHAR", type_.length, type_.collation)
+        return self._render_string_type(
+            "NCHAR",
+            type_.length,
+            type_.collation,
+            type_.collation_schema,
+            **kw,
+        )
 
     def visit_VARCHAR(self, type_: sqltypes.String, **kw: Any) -> str:
         return self._render_string_type(
-            "VARCHAR", type_.length, type_.collation
+            "VARCHAR",
+            type_.length,
+            type_.collation,
+            type_.collation_schema,
+            **kw,
         )
 
     def visit_NVARCHAR(self, type_: sqltypes.NVARCHAR, **kw: Any) -> str:
         return self._render_string_type(
-            "NVARCHAR", type_.length, type_.collation
+            "NVARCHAR",
+            type_.length,
+            type_.collation,
+            type_.collation_schema,
+            **kw,
         )
 
     def visit_TEXT(self, type_: sqltypes.Text, **kw: Any) -> str:
-        return self._render_string_type("TEXT", type_.length, type_.collation)
+        return self._render_string_type(
+            "TEXT",
+            type_.length,
+            type_.collation,
+            type_.collation_schema,
+            **kw,
+        )
 
     def visit_UUID(self, type_: sqltypes.Uuid[Any], **kw: Any) -> str:
         return "UUID"
@@ -7743,7 +7830,13 @@ class GenericTypeCompiler(TypeCompiler):
 
     def visit_uuid(self, type_: sqltypes.Uuid[Any], **kw: Any) -> str:
         if not type_.native_uuid or not self.dialect.supports_native_uuid:
-            return self._render_string_type("CHAR", length=32, collation=None)
+            return self._render_string_type(
+                "CHAR",
+                length=32,
+                collation=None,
+                collation_schema=None,
+                **kw,
+            )
         else:
             return self.visit_UUID(type_, **kw)
 
@@ -8046,6 +8139,12 @@ class IdentifierPreparer:
 
     def _requires_quotes(self, value: str) -> bool:
         """Return True if the given identifier requires quoting."""
+        if not value:
+            # a blank name is legal on SQLite only, where it can be
+            # delivered by reflection; quote it so that it renders as the
+            # database has it, rather than indexing into an empty string
+            # below
+            return True
         lc_value = value.lower()
         return (
             lc_value in self.reserved_words
@@ -8102,11 +8201,16 @@ class IdentifierPreparer:
         else:
             return ident
 
-    def format_collation(self, collation_name):
+    def format_collation(self, collation_name, collation_schema=None):
         if self.quote_case_sensitive_collations:
-            return self.quote(collation_name)
+            name = self.quote(collation_name)
         else:
-            return collation_name
+            name = collation_name
+
+        if collation_schema is not None:
+            return f"{self.quote_schema(collation_schema)}.{name}"
+        else:
+            return name
 
     def format_sequence(
         self, sequence: schema.Sequence, use_schema: bool = True

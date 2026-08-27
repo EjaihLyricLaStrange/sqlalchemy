@@ -32,12 +32,12 @@ jobs:
           - "windows-11-arm"
           - "macos-latest"
         python-version:
-          - "3.10"
           - "3.11"
           - "3.12"
           - "3.13"
           - "3.14"
           - "3.14t"
+          - "3.15"
         build-type:
           # builds greenlet, runs asyncio tests.  includes aiosqlite driver
           - "cext-greenlet"
@@ -87,8 +87,6 @@ jobs:
           - os: "macos-latest"
             architecture: x64
           - os: "windows-11-arm"
-            python-version: "3.10"
-          - os: "windows-11-arm"
             architecture: x86
           - os: "windows-11-arm"
             architecture: x64
@@ -108,6 +106,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
+          # needed for python versions that are not yet released, e.g. 3.15
+          allow-prereleases: true
 
       - name: Install dependencies
         run: |

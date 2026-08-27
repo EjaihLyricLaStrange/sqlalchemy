@@ -1359,6 +1359,36 @@ class SelectTest(fixtures.TestBase, AssertsCompiledSQL):
             "HAVING count(myothertable.otherid) > :count_2)",
         )
 
+    def test_exists_with_hint(self):
+        stmt = table1.select().where(
+            exists(1)
+            .select_from(table2)
+            .with_hint(table2, "WITH (NOLOCK)", "mssql")
+        )
+
+        self.assert_compile(
+            stmt,
+            "SELECT mytable.myid, mytable.name, mytable.description "
+            "FROM mytable WHERE EXISTS (SELECT 1 FROM myothertable "
+            "WITH (NOLOCK))",
+            dialect=mssql.dialect(),
+        )
+
+    def test_exists_with_statement_hint(self):
+        stmt = table1.select().where(
+            exists(1)
+            .select_from(table2)
+            .with_statement_hint("WITH (NOLOCK)", "mssql")
+        )
+
+        self.assert_compile(
+            stmt,
+            "SELECT mytable.myid, mytable.name, mytable.description "
+            "FROM mytable WHERE EXISTS (SELECT 1 FROM myothertable "
+            "WITH (NOLOCK))",
+            dialect=mssql.dialect(),
+        )
+
     def test_where_subquery(self):
         s = (
             select(addresses.c.street)
@@ -2372,6 +2402,13 @@ class SelectTest(fixtures.TestBase, AssertsCompiledSQL):
             "SELECT x ORDER BY x COLLATE bar",
         )
 
+        # columns clause, schema-qualified collation
+        self.assert_compile(
+            select(column("x").collate("bar", collation_schema="myschema")),
+            "SELECT x COLLATE myschema.bar AS anon_1",
+            dialect=postgresql.dialect(),
+        )
+
     def test_literal(self):
         self.assert_compile(
             select(literal("foo")), "SELECT :param_1 AS anon_1"
@@ -3046,40 +3083,61 @@ class SelectTest(fixtures.TestBase, AssertsCompiledSQL):
         (
             "default",
             None,
+            None,
             "SELECT CAST(t1.txt AS VARCHAR(10)) AS txt FROM t1",
             None,
         ),
         (
             "explicit_mssql",
             "Latin1_General_CI_AS",
+            None,
             "SELECT CAST(t1.txt AS VARCHAR(10)) COLLATE Latin1_General_CI_AS AS txt FROM t1",  # noqa
             mssql.dialect(),
         ),
         (
             "explicit_mysql",
             "utf8mb4_unicode_ci",
+            None,
             "SELECT CAST(t1.txt AS CHAR(10)) AS txt FROM t1",
             mysql.dialect(),
         ),
         (
             "explicit_postgresql",
             "en_US",
+            None,
             'SELECT CAST(t1.txt AS VARCHAR(10)) COLLATE "en_US" AS txt FROM t1',  # noqa
+            postgresql.dialect(),
+        ),
+        (
+            "explicit_postgresql_schema",
+            "en_US",
+            "myschema",
+            'SELECT CAST(t1.txt AS VARCHAR(10)) COLLATE myschema."en_US" AS txt FROM t1',  # noqa
             postgresql.dialect(),
         ),
         (
             "explicit_sqlite",
             "NOCASE",
+            None,
             'SELECT CAST(t1.txt AS VARCHAR(10)) COLLATE "NOCASE" AS txt FROM t1',  # noqa
             sqlite.dialect(),
         ),
-        id_="iaaa",
+        id_="iaaaa",
     )
-    def test_cast_with_collate(self, collation_name, expected_sql, dialect):
+    def test_cast_with_collate(
+        self, collation_name, collation_schema, expected_sql, dialect
+    ):
         t1 = Table(
             "t1",
             MetaData(),
-            Column("txt", String(10, collation=collation_name)),
+            Column(
+                "txt",
+                String(
+                    10,
+                    collation=collation_name,
+                    collation_schema=collation_schema,
+                ),
+            ),
         )
         stmt = select(func.cast(t1.c.txt, t1.c.txt.type))
         self.assert_compile(stmt, expected_sql, dialect=dialect)
@@ -4281,6 +4339,51 @@ class BindParameterTest(AssertsCompiledSQL, fixtures.TestBase):
             checkparams={"3foo_1": "foo", "4_foo_1": "bar"},
         )
 
+    def test_bind_anon_name_special_chars_uniqueify_three(self):
+        """test #13534
+
+        the escape characters that are applied only by the compiler were
+        not part of the anon name escape, so names differing only in those
+        characters produced the same compiled bind name.
+
+        """
+        t = table("t", column("a.b"), column("a_b"))
+
+        self.assert_compile(
+            (t.c["a.b"] == "foo") & (t.c["a_b"] == "bar"),
+            't."a.b" = :a_b_1 AND t.a_b = :a_b_2',
+            checkparams={"a_b_1": "foo", "a_b_2": "bar"},
+        )
+
+    def test_bind_anon_name_special_chars_uniqueify_four(self):
+        """test #13534, brackets and colons"""
+
+        t = table("t", column("a[b]"), column("a:b"), column("a b"))
+
+        self.assert_compile(
+            (t.c["a[b]"] == "foo")
+            & (t.c["a:b"] == "bar")
+            & (t.c["a b"] == "bat"),
+            't."a[b]" = :a_b_1 AND t."a:b" = :a_b_2 AND t."a b" = :a_b_3',
+            checkparams={"a_b_1": "foo", "a_b_2": "bar", "a_b_3": "bat"},
+        )
+
+    def test_bind_anon_name_special_chars_positional(self):
+        """test #13534
+
+        the collision reached the DBAPI for positional paramstyles, where
+        the same name was emitted for both positions.
+
+        """
+        t = table("t", column("a.b"), column("a_b"))
+
+        self.assert_compile(
+            (t.c["a.b"] == "foo") & (t.c["a_b"] == "bar"),
+            't."a.b" = ? AND t.a_b = ?',
+            checkpositional=("foo", "bar"),
+            dialect="sqlite",
+        )
+
     def test_bind_given_anon_name_dont_double(self):
         c = column("id")
         l = c.label(None)
@@ -5299,10 +5402,13 @@ class BindParameterTest(AssertsCompiledSQL, fixtures.TestBase):
 
     @testing.variation("use_positional", [True, False])
     def test_standalone_bindparam_escape_collision(self, use_positional):
-        """this case is currently not supported
+        """test #13534
 
-        it's kinda bad since positional takes the unescaped param
-        while non positional takes the escaped one.
+        ``"[brackets]"`` escapes to ``_brackets_``, which is also the name
+        of the second parameter; the escaped name is uniquified so that the
+        two remain distinct.  Previously both rendered as ``_brackets_`` and
+        the value for one of them was silently discarded.
+
         """
         stmt = select(table1.c.myid).where(
             table1.c.name == bindparam("[brackets]", value="x"),
@@ -5315,16 +5421,16 @@ class BindParameterTest(AssertsCompiledSQL, fixtures.TestBase):
                 "SELECT mytable.myid FROM mytable WHERE mytable.name = ? "
                 "AND mytable.description = ?",
                 params={"[brackets]": "a", "_brackets_": "b"},
-                checkpositional=("a", "a"),
+                checkpositional=("a", "b"),
                 dialect="sqlite",
             )
         else:
             self.assert_compile(
                 stmt,
                 "SELECT mytable.myid FROM mytable WHERE mytable.name = "
-                ":_brackets_ AND mytable.description = :_brackets_",
+                ":_brackets_ AND mytable.description = :_brackets___1",
                 params={"[brackets]": "a", "_brackets_": "b"},
-                checkparams={"_brackets_": "b"},
+                checkparams={"_brackets_": "a", "_brackets___1": "b"},
                 dialect="default",
             )
 

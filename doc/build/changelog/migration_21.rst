@@ -23,6 +23,22 @@ potentially backwards-incompatible changes in behavior.
 General
 =======
 
+.. _change_python_versions:
+
+Python version compatibility starts at version 3.11
+---------------------------------------------------
+
+In order to give the 2.1 series the most runway for maintaining Python version
+compatibility while still remaining up to date with current released Python
+versions, Python 3.10 is dropped as of August, 2026 in preparation for Python
+3.10 EOL in October of 2026.   The goal is that no Python versions would need
+to be dropped throughout the release span of the 2.1 series, just as it's been
+with every other SQLAlchemy major release series.   The 1.4 and 2.0 series
+of SQLAlchemy each had four year lifespans which meant they needed to support
+a very long series of Python releases (3.7 through 3.15 for SQLAlchemy 2.0).
+It's hoped that the 2.1 series will have a little less of a span to support
+by the time it reaches EOL.
+
 .. _change_10197:
 
 Asyncio "greenlet" dependency no longer installs by default
@@ -1106,6 +1122,58 @@ raise an error, directing users to use :class:`_sql.FrameClause` instead.
 
 :ticket:`12596`
 
+.. _change_13507:
+
+Loader options from a deeper path no longer apply to an object loaded at the top
+---------------------------------------------------------------------------------
+
+The same object can be loaded more than once within a single query.  Given
+``A.b`` referring to ``B``, ``B.a`` referring back to ``A``, and ``A.c``
+referring to ``C``, the query below loads ``A`` twice: once as the entity
+being selected, and again underneath ``A.b -> B.a``::
+
+    stmt = select(A).options(
+        joinedload(A.b).joinedload(B.a).raiseload("*"),
+        joinedload(A.c),
+    )
+
+    a = session.scalars(stmt).unique().one()
+
+SQLAlchemy remembers which of those two paths an object was loaded under, and
+applies the loader options from that path whenever more SQL is emitted for the
+object later on::
+
+    session.expire(a)
+
+    a.value  # refresh, emitting SELECT for the "a" row
+
+    a.c  # 2.0: raises InvalidRequestError; 2.1: loads normally
+
+In 2.0 it was difficult to predict which of the paths would be the one
+remembered, as it varied with the loader strategy in use, so the
+``raiseload("*")`` written for ``A.b -> B.a`` could end up applied to ``a``
+itself.  In 2.1 the shallowest path is favored, a deterministic rule rather
+than one based on which loader strategy within the query happened to see the
+object first.
+
+This applies to all forms of :term:`lazy loading`, such as when expired
+attributes are unexpired, deferred columns are loaded, or unloaded
+relationships are loaded::
+
+    stmt = select(A).options(
+        joinedload(A.b).joinedload(B.a).lazyload(A.c).joinedload(C.d),
+    )
+
+    a = session.scalars(stmt).unique().one()
+
+    a.c  # 2.0: SELECT from "c" with a JOIN to "d"; 2.1: SELECT from "c"
+
+Code that relies on complex interactions of overlapping paths may need
+adjustment, as the behavior should now be consistent across the different
+kinds of loader option.
+
+:ticket:`13507`
+
 
 Core - Behavioral Changes and Improvements
 ==========================================
@@ -1330,6 +1398,52 @@ In most cases, this change is expected to make
 :meth:`_sql.Select.filter_by` more intuitive to use.
 
 :ticket:`8601`
+
+.. _change_13526:
+
+Foreign key constraints may name the same local column more than once
+----------------------------------------------------------------------
+
+:class:`.ForeignKeyConstraint` now accepts a constraint which names the same
+local column in more than one position, such as ``FOREIGN KEY (a, a)
+REFERENCES r (b, c)``.  Previously this raised :class:`.ArgumentError`.
+
+A self-referential example, which constrains a "merge" pointer so that it may
+only ever target a canonical row::
+
+    profile_merges = Table(
+        "profile_merges",
+        metadata,
+        Column("profile_id", String(50), primary_key=True),
+        Column("canonical_profile_id", String(50), nullable=False),
+        UniqueConstraint("profile_id", "canonical_profile_id"),
+        ForeignKeyConstraint(
+            ["canonical_profile_id", "canonical_profile_id"],
+            ["profile_merges.profile_id", "profile_merges.canonical_profile_id"],
+        ),
+    )
+
+Such a constraint now emits in DDL and is reflected like any other composite
+foreign key.
+
+A column may likewise be named more than once on the referenced side, such as
+``FOREIGN KEY (a, b) REFERENCES r (c, c)``, which constrains the local row so
+that its ``a`` and ``b`` values are equal.  This form has always been accepted
+by :class:`.ForeignKeyConstraint` and is likewise emitted in DDL and reflected;
+support for it is unchanged, and the two forms may be combined.  Backends vary
+in whether they accept either form, as a foreign key requires a unique
+constraint on the referenced columns.
+
+Additionally, the check that the number of constrained columns matches the
+number of referenced columns has been fixed; a genuine mismatch such as::
+
+    ForeignKeyConstraint(["x", "x"], ["r.b"])  # two local, one remote
+
+was formerly accepted, rendering ``FOREIGN KEY(x) REFERENCES r (b)`` and
+silently dropping a column.  It now raises :class:`.ArgumentError`.
+
+:ticket:`13526`
+
 
 .. _change_13381:
 
@@ -1907,6 +2021,58 @@ server-side function calls).
     :ref:`postgresql_monotonic_functions` - PostgreSQL-specific examples
 
 :ticket:`13014`
+
+.. _change_9693_postgresql:
+
+Schema-Qualified Collation Names
+---------------------------------
+
+PostgreSQL collations are schema-qualified catalog objects (e.g.
+``CREATE COLLATION my_schema.my_collation (...)``).  Previously, there was
+no way to correctly indicate a schema-qualified collation using the
+:paramref:`.String.collation` parameter; a value such as
+``collation="my_schema.my_collation"`` would render as a single,
+incorrectly-quoted identifier.
+
+A new parameter :paramref:`.String.collation_schema` is added, used
+in conjunction with :paramref:`.String.collation`, to indicate the schema
+in which the collation is defined.  The same parameter is also added to
+:class:`_postgresql.DOMAIN` as :paramref:`_postgresql.DOMAIN.collation_schema`,
+as well as to :func:`_sql.collate` and :meth:`.ColumnOperators.collate` as
+``collation_schema``::
+
+    Column(
+        "data",
+        String(collation="my_collation", collation_schema="my_schema"),
+    )
+
+The above renders DDL similar to:
+
+.. sourcecode:: sql
+
+    data VARCHAR COLLATE "my_schema"."my_collation"
+
+As part of this change, all collation-name rendering across DDL and the
+:func:`_sql.collate` construct now consistently uses the dialect's
+identifier preparer for quoting, rather than several separate, inconsistent
+hand-quoting code paths that existed previously.  As a side effect, simple
+lowercase collation names such as ``"utf8"`` are no longer unconditionally
+quoted in generated DDL, as this quoting was never necessary for such names.
+
+Additionally, reflection of columns and :class:`_postgresql.DOMAIN` objects
+now populates :paramref:`.String.collation_schema` /
+:paramref:`_postgresql.DOMAIN.collation_schema` when the underlying
+collation is schema-qualified, so that reflected DDL round-trips exactly.
+The schema is omitted from the reflected value when the collation is
+visible on the current ``search_path`` without qualification.
+
+.. seealso::
+
+    :ref:`postgresql_collation`
+
+:ticket:`9693`
+
+:ticket:`6511`
 
 
 Microsoft SQL Server

@@ -25,8 +25,8 @@ jobs:
         os:
           - "ubuntu-22.04"
         python-version:
-          - "3.13"
           - "3.14"
+          - "3.15"
         build-type:
           - "cext-greenlet"
           - "cext"
@@ -46,6 +46,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           architecture: ${{ matrix.architecture }}
+          # needed for python versions that are not yet released, e.g. 3.15
+          allow-prereleases: true
 
       - name: Install dependencies
         run: |

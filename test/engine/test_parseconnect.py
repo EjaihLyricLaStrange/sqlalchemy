@@ -1,4 +1,5 @@
 import copy
+import re
 from unittest.mock import call
 from unittest.mock import MagicMock
 from unittest.mock import Mock
@@ -545,6 +546,172 @@ class DialectImportTest(fixtures.TestBase):
             eq_(dialect.name, name)
 
 
+class DBAPIVersionTest(fixtures.TestBase):
+    """test :attr:`.Dialect.dbapi_version` and the
+    :meth:`.Dialect.retrieve_dbapi_version` hook."""
+
+    def _dialect_cls(self, **kw):
+        class MyDialect(DefaultDialect):
+            name = "mydialect"
+            driver = "mydriver"
+            retrieve_calls = 0
+
+            def retrieve_dbapi_version(self, dbapi):
+                MyDialect.retrieve_calls += 1
+                return tsa.util.parse_version_string(
+                    getattr(dbapi, "__version__", None)
+                )
+
+        return MyDialect
+
+    def test_version_from_hook(self):
+        d = self._dialect_cls()(dbapi=Mock(__version__="1.2.3"))
+        eq_(d.dbapi_version, (1, 2, 3))
+
+    def test_memoized(self):
+        """the hook is invoked once for repeated reads"""
+
+        cls = self._dialect_cls()
+        d = cls(dbapi=Mock(__version__="1.2.3"))
+        eq_([d.dbapi_version, d.dbapi_version, d.dbapi_version][0], (1, 2, 3))
+        eq_(cls.retrieve_calls, 1)
+
+    def test_no_dbapi_not_memoized(self):
+        """a dialect with no DBAPI raises, and picks up a DBAPI which is
+        established afterwards"""
+
+        cls = self._dialect_cls()
+        d = cls()
+
+        with expect_raises_message(
+            exc.NoDBAPILoaded,
+            "Dialect mydialect\\+mydriver has no DBAPI module loaded",
+        ):
+            d.dbapi_version
+
+        eq_(cls.retrieve_calls, 0)
+        is_false("dbapi_version" in d.__dict__)
+
+        d.dbapi = Mock(__version__="1.2.3")
+        eq_(d.dbapi_version, (1, 2, 3))
+
+    def test_hook_not_implemented(self):
+        class NoHookDialect(DefaultDialect):
+            name = "nohook"
+            driver = "nohook"
+
+        d = NoHookDialect(dbapi=Mock(__version__="1.2.3"))
+        with expect_raises_message(
+            NotImplementedError,
+            "Dialect nohook\\+nohook does not implement "
+            "retrieve_dbapi_version\\(\\)",
+        ):
+            d.dbapi_version
+
+    def test_version_not_determinable(self):
+        # a DBAPI which publishes no version at all
+        dbapi = Mock(spec=["paramstyle"], __name__="mydbapi")
+        dbapi.paramstyle = "qmark"
+        d = self._dialect_cls()(dbapi=dbapi)
+        with expect_raises_message(
+            exc.NoDBAPILoaded,
+            "Dialect mydialect\\+mydriver could not determine a version "
+            "for its DBAPI module 'mydbapi'",
+        ):
+            d.dbapi_version
+
+    def test_version_not_determinable_wrapper_dbapi(self):
+        """asyncio dialects have a wrapper object rather than a module,
+        which has no __name__ to name in the message"""
+
+        dbapi = Mock(spec=["paramstyle"])
+        dbapi.paramstyle = "qmark"
+        d = self._dialect_cls()(dbapi=dbapi)
+        with expect_raises_message(
+            exc.NoDBAPILoaded,
+            "Dialect mydialect\\+mydriver could not determine a version "
+            "for its DBAPI module 'mydriver'",
+        ):
+            d.dbapi_version
+
+    @testing.combinations("no_dbapi", "no_version", argnames="scenario")
+    def test_or_none_helper(self, scenario):
+        """_dbapi_version_or_none returns None rather than raising"""
+
+        if scenario == "no_dbapi":
+            dbapi = None
+        else:
+            dbapi = Mock(spec=["paramstyle"], __name__="mydbapi")
+            dbapi.paramstyle = "qmark"
+
+        d = self._dialect_cls()(dbapi=dbapi)
+        is_(d._dbapi_version_or_none, None)
+
+    def test_or_none_helper_present(self):
+        d = self._dialect_cls()(dbapi=Mock(__version__="1.2.3"))
+        eq_(d._dbapi_version_or_none, (1, 2, 3))
+
+
+class MinimumDBAPIVersionTest(fixtures.TestBase):
+    """test :attr:`.Dialect.minimum_dbapi_version`."""
+
+    def _dialect_cls(self):
+        class MyDialect(DefaultDialect):
+            name = "mydialect"
+            driver = "mydriver"
+
+            minimum_dbapi_version = tsa.util.VersionInfo((2, 5))
+
+            def retrieve_dbapi_version(self, dbapi):
+                return tsa.util.parse_version_string(
+                    getattr(dbapi, "__version__", None)
+                )
+
+        return MyDialect
+
+    @testing.combinations("2.5", "2.5.1", "3.0", argnames="version")
+    def test_version_ok(self, version):
+        d = self._dialect_cls()(
+            dbapi=Mock(__name__="mydbapi", __version__=version)
+        )
+        eq_(d.dbapi_version, tsa.util.parse_version_string(version))
+
+    @testing.combinations("2.4.9", "2.5rc1", "1.0", argnames="version")
+    def test_version_too_low(self, version):
+        with expect_raises_message(
+            exc.InvalidRequestError,
+            "Dialect mydialect\\+mydriver requires version 2.5 or greater "
+            f"of the mydbapi DBAPI; version {re.escape(version)} is "
+            "installed",
+        ):
+            self._dialect_cls()(
+                dbapi=Mock(__name__="mydbapi", __version__=version)
+            )
+
+    @testing.combinations("no_dbapi", "no_version", argnames="scenario")
+    def test_no_version_no_check(self, scenario):
+        """a version which can't be determined skips the check"""
+
+        if scenario == "no_dbapi":
+            dbapi = None
+        else:
+            dbapi = Mock(spec=["paramstyle"], __name__="mydbapi")
+            dbapi.paramstyle = "qmark"
+
+        d = self._dialect_cls()(dbapi=dbapi)
+        is_(d._dbapi_version_or_none, None)
+
+    def test_no_minimum_no_check(self):
+        """a dialect with no minimum doesn't consult the version at all"""
+
+        class NoHookDialect(DefaultDialect):
+            name = "nohook"
+            driver = "nohook"
+
+        # retrieve_dbapi_version() would raise NotImplementedError
+        NoHookDialect(dbapi=Mock(__name__="mydbapi", __version__="1.0"))
+
+
 class CreateEngineTest(fixtures.TestBase):
     """test that create_engine arguments of different types get
     propagated properly"""
@@ -1034,10 +1201,7 @@ class TestRegNewDBAPI(fixtures.TestBase):
             ],
         )
 
-    @testing.requires.sqlite
     def test_plugin_url_registration(self):
-        from sqlalchemy.dialects import sqlite
-
         global MyEnginePlugin
 
         def side_effect(url, kw):
@@ -1059,38 +1223,35 @@ class TestRegNewDBAPI(fixtures.TestBase):
         MyEnginePlugin = Mock(side_effect=side_effect, update_url=update_url)
 
         plugins.register("engineplugin", __name__, "MyEnginePlugin")
+        registry.register("mockdialect", __name__, "MockDialect")
 
         e = create_engine(
-            "sqlite:///?plugin=engineplugin&foo=bar&myplugin_arg=bat",
+            "mockdialect://?plugin=engineplugin&foo=bar&myplugin_arg=bat",
             logging_name="foob",
         )
-        eq_(e.dialect.name, "sqlite")
         eq_(e.logging_name, "bar")
 
         # plugin args are removed from URL.
         eq_(e.url.query, {"foo": "bar"})
-        assert isinstance(e.dialect, sqlite.dialect)
+        assert isinstance(e.dialect, MockDialect)
 
         eq_(
             MyEnginePlugin.mock_calls,
             [
                 call(
                     url.make_url(
-                        "sqlite:///?plugin=engineplugin"
+                        "mockdialect://?plugin=engineplugin"
                         "&foo=bar&myplugin_arg=bat"
                     ),
                     {},
                 ),
-                call.handle_dialect_kwargs(sqlite.dialect, mock.ANY),
+                call.handle_dialect_kwargs(MockDialect, mock.ANY),
                 call.handle_pool_kwargs(mock.ANY, {"dialect": e.dialect}),
                 call.engine_created(e),
             ],
         )
 
-    @testing.requires.sqlite
     def test_plugin_multiple_url_registration(self):
-        from sqlalchemy.dialects import sqlite
-
         global MyEnginePlugin1
         global MyEnginePlugin2
 
@@ -1116,27 +1277,27 @@ class TestRegNewDBAPI(fixtures.TestBase):
 
         plugins.register("engineplugin1", __name__, "MyEnginePlugin1")
         plugins.register("engineplugin2", __name__, "MyEnginePlugin2")
+        registry.register("mockdialect", __name__, "MockDialect")
 
         url_str = (
-            "sqlite:///?plugin=engineplugin1&foo=bar&myplugin1_arg=bat"
+            "mockdialect://?plugin=engineplugin1&foo=bar&myplugin1_arg=bat"
             "&plugin=engineplugin2&myplugin2_arg=hoho"
         )
         e = create_engine(
             url_str,
             logging_name="foob",
         )
-        eq_(e.dialect.name, "sqlite")
         eq_(e.logging_name, "bar")
 
         # plugin args are removed from URL.
         eq_(e.url.query, {"foo": "bar"})
-        assert isinstance(e.dialect, sqlite.dialect)
+        assert isinstance(e.dialect, MockDialect)
 
         eq_(
             MyEnginePlugin1.mock_calls,
             [
                 call(url.make_url(url_str), {}),
-                call.handle_dialect_kwargs(sqlite.dialect, mock.ANY),
+                call.handle_dialect_kwargs(MockDialect, mock.ANY),
                 call.handle_pool_kwargs(mock.ANY, {"dialect": e.dialect}),
                 call.engine_created(e),
             ],
@@ -1146,16 +1307,13 @@ class TestRegNewDBAPI(fixtures.TestBase):
             MyEnginePlugin2.mock_calls,
             [
                 call(url.make_url(url_str), {}),
-                call.handle_dialect_kwargs(sqlite.dialect, mock.ANY),
+                call.handle_dialect_kwargs(MockDialect, mock.ANY),
                 call.handle_pool_kwargs(mock.ANY, {"dialect": e.dialect}),
                 call.engine_created(e),
             ],
         )
 
-    @testing.requires.sqlite
     def test_plugin_arg_registration(self):
-        from sqlalchemy.dialects import sqlite
-
         global MyEnginePlugin
 
         def side_effect(url, kw):
@@ -1177,23 +1335,23 @@ class TestRegNewDBAPI(fixtures.TestBase):
         MyEnginePlugin = Mock(side_effect=side_effect, update_url=update_url)
 
         plugins.register("engineplugin", __name__, "MyEnginePlugin")
+        registry.register("mockdialect", __name__, "MockDialect")
 
         e = create_engine(
-            "sqlite:///?foo=bar",
+            "mockdialect://?foo=bar",
             logging_name="foob",
             plugins=["engineplugin"],
             myplugin_arg="bat",
         )
-        eq_(e.dialect.name, "sqlite")
         eq_(e.logging_name, "bar")
 
-        assert isinstance(e.dialect, sqlite.dialect)
+        assert isinstance(e.dialect, MockDialect)
 
         eq_(
             MyEnginePlugin.mock_calls,
             [
-                call(url.make_url("sqlite:///?foo=bar"), {}),
-                call.handle_dialect_kwargs(sqlite.dialect, mock.ANY),
+                call(url.make_url("mockdialect://?foo=bar"), {}),
+                call.handle_dialect_kwargs(MockDialect, mock.ANY),
                 call.handle_pool_kwargs(mock.ANY, {"dialect": e.dialect}),
                 call.engine_created(e),
             ],
