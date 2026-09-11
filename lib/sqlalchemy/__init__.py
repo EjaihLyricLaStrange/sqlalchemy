@@ -74,6 +74,7 @@ from .schema import ExecutableDDLElement as ExecutableDDLElement
 from .schema import FetchedValue as FetchedValue
 from .schema import ForeignKey as ForeignKey
 from .schema import ForeignKeyConstraint as ForeignKeyConstraint
+from .schema import ForeignKeyTarget as ForeignKeyTarget
 from .schema import Identity as Identity
 from .schema import Index as Index
 from .schema import insert_sentinel as insert_sentinel
@@ -284,7 +285,7 @@ from .types import Uuid as Uuid
 from .types import VARBINARY as VARBINARY
 from .types import VARCHAR as VARCHAR
 
-__version__ = "2.1.0b4"
+__version__ = "2.1.0"
 
 
 def __go(lcls: Any) -> None:

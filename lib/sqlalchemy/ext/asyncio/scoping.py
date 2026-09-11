@@ -12,6 +12,7 @@ from typing import Callable
 from typing import Generic
 from typing import Iterable
 from typing import Iterator
+from typing import Mapping
 from typing import Optional
 from typing import overload
 from typing import Sequence
@@ -40,27 +41,33 @@ if TYPE_CHECKING:
     from .engine import AsyncConnection
     from .result import AsyncResult
     from .result import AsyncScalarResult
+    from .session import _AsyncSessionBind
     from .session import AsyncSessionTransaction
     from ...engine import Connection
     from ...engine import Engine
     from ...engine import Result
     from ...engine import Row
     from ...engine import RowMapping
+    from ...engine import ScalarResult
     from ...engine.interfaces import _CoreAnyExecuteParams
+    from ...engine.interfaces import _ExecuteOptions
     from ...engine.interfaces import CoreExecuteOptionsParameter
-    from ...engine.result import ScalarResult
     from ...orm._typing import _IdentityKeyType
     from ...orm._typing import _O
     from ...orm._typing import OrmExecuteOptionsParameter
+    from ...orm.identity import IdentityMap
     from ...orm.interfaces import ORMOption
     from ...orm.session import _BindArguments
     from ...orm.session import _EntityBindKey
     from ...orm.session import _PKIdentityArgument
     from ...orm.session import _SessionBind
+    from ...orm.session import _SessionBindKey
+    from ...sql._typing import _InfoType
     from ...sql.base import Executable
     from ...sql.elements import ClauseElement
     from ...sql.selectable import ForUpdateParameter
     from ...sql.selectable import TypedReturnsRows
+    from ...util import IdentitySet
 
 _T = TypeVar("_T", bound=Any)
 _Ts = TypeVarTuple("_Ts")
@@ -92,6 +99,7 @@ _Ts = TypeVarTuple("_Ts")
         "expunge_all",
         "flush",
         "get_bind",
+        "get_async_bind",
         "is_modified",
         "invalidate",
         "merge",
@@ -107,6 +115,7 @@ _Ts = TypeVarTuple("_Ts")
     ],
     attributes=[
         "bind",
+        "binds",
         "dirty",
         "deleted",
         "new",
@@ -850,10 +859,66 @@ class async_scoped_session(Generic[_AS]):
         blocking-style code, which will be translated to implicitly async calls
         at the point of invoking IO on the database drivers.
 
+        .. seealso::
+
+            :meth:`.AsyncSession.get_async_bind`
+
 
         """  # noqa: E501
 
         return self._proxied.get_bind(
+            mapper=mapper, clause=clause, bind=bind, **kw
+        )
+
+    def get_async_bind(
+        self,
+        mapper: Optional[_EntityBindKey[_O]] = None,
+        clause: Optional[ClauseElement] = None,
+        bind: Optional[_AsyncSessionBind] = None,
+        **kw: Any,
+    ) -> _AsyncSessionBind:
+        r"""Return a "bind" to which this :class:`.AsyncSession` is bound.
+
+        .. container:: class_bases
+
+            Proxied for the :class:`_asyncio.AsyncSession` class on
+            behalf of the :class:`_asyncio.scoping.async_scoped_session` class.
+
+        This is the asyncio-facing counterpart to
+        :meth:`.AsyncSession.get_bind`; the bind resolved against the
+        underlying :attr:`.AsyncSession.sync_session` is translated back into
+        the :class:`.AsyncEngine` or :class:`.AsyncConnection` that it was
+        derived from.  :paramref:`.AsyncSession.get_async_bind.bind` is
+        likewise given as an asyncio object, and is translated on the way in.
+
+        Raises :class:`_asyncio.exc.AsyncBindNotFound` if the bind that's
+        resolved has no asyncio counterpart known to this
+        :class:`.AsyncSession`.
+
+        Like :meth:`.AsyncSession.get_bind`, this method is currently
+        **not** used by this :class:`.AsyncSession` in any way in order to
+        resolve engines for requests.
+
+        .. note::
+
+            This method delegates to :meth:`.AsyncSession.get_bind`, and is
+            likewise currently **not** useful as an override target, in
+            contrast to that of the :meth:`_orm.Session.get_bind` method.
+            To apply a custom bind-lookup scheme to an
+            :class:`.AsyncSession`, subclass :class:`_orm.Session` and apply
+            it using :paramref:`.AsyncSession.sync_session_class`, as
+            illustrated at :meth:`.AsyncSession.get_bind`.
+
+        .. versionadded:: 2.1
+
+        .. seealso::
+
+            :meth:`.AsyncSession.get_bind`
+
+
+        """  # noqa: E501
+
+        return self._proxied.get_async_bind(
             mapper=mapper, clause=clause, bind=bind, **kw
         )
 
@@ -1353,20 +1418,63 @@ class async_scoped_session(Generic[_AS]):
         )
 
     @property
-    def bind(self) -> Any:
-        r"""Proxy for the :attr:`_asyncio.AsyncSession.bind` attribute
-        on behalf of the :class:`_asyncio.scoping.async_scoped_session` class.
+    def bind(self) -> Optional[_AsyncSessionBind]:
+        r"""The :class:`_asyncio.AsyncEngine` or
+        :class:`_asyncio.AsyncConnection` this :class:`_asyncio.AsyncSession`
+        is bound to, if any.
+
+        .. container:: class_bases
+
+            Proxied for the :class:`_asyncio.AsyncSession` class
+            on behalf of the :class:`_asyncio.scoping.async_scoped_session` class.
+
+        The value is derived from :attr:`_orm.Session.bind` on the underlying
+        :attr:`_asyncio.AsyncSession.sync_session`, translated back into the
+        asyncio object it was established from, so that a bind assigned after
+        construction is reflected here as well.  The attribute may be assigned
+        to, which establishes the bind on the
+        :attr:`_asyncio.AsyncSession.sync_session`.
+
+        .. versionadded:: 2.1
+
 
         """  # noqa: E501
 
         return self._proxied.bind
 
     @bind.setter
-    def bind(self, attr: Any) -> None:
+    def bind(self, attr: Optional[_AsyncSessionBind]) -> None:
         self._proxied.bind = attr
 
     @property
-    def dirty(self) -> Any:
+    def binds(self) -> Mapping[_SessionBindKey, _AsyncSessionBind]:
+        r"""An immutable mapping of the per-mapper / per-table binds established
+        for this :class:`_asyncio.AsyncSession`.
+
+        .. container:: class_bases
+
+            Proxied for the :class:`_asyncio.AsyncSession` class
+            on behalf of the :class:`_asyncio.scoping.async_scoped_session` class.
+
+        Like :attr:`_asyncio.AsyncSession.bind`, the collection is derived from
+        :attr:`_orm.Session.binds` on the underlying
+        :attr:`_asyncio.AsyncSession.sync_session` with each bind translated
+        back into the asyncio object it was established from; the keys are
+        therefore normalized in the same way as they are for
+        :attr:`_orm.Session.binds`.
+
+        As the collection is derived it is read-only; binds are established by
+        passing the :paramref:`_asyncio.AsyncSession.binds` parameter.
+
+        .. versionadded:: 2.1
+
+
+        """  # noqa: E501
+
+        return self._proxied.binds
+
+    @property
+    def dirty(self) -> IdentitySet:
         r"""The set of all persistent instances considered dirty.
 
         .. container:: class_bases
@@ -1405,7 +1513,7 @@ class async_scoped_session(Generic[_AS]):
         return self._proxied.dirty
 
     @property
-    def deleted(self) -> Any:
+    def deleted(self) -> IdentitySet:
         r"""The set of all instances marked as 'deleted' within this ``Session``
 
         .. container:: class_bases
@@ -1424,7 +1532,7 @@ class async_scoped_session(Generic[_AS]):
         return self._proxied.deleted
 
     @property
-    def new(self) -> Any:
+    def new(self) -> IdentitySet:
         r"""The set of all instances marked as 'new' within this ``Session``.
 
         .. container:: class_bases
@@ -1443,7 +1551,7 @@ class async_scoped_session(Generic[_AS]):
         return self._proxied.new
 
     @property
-    def identity_map(self) -> Any:
+    def identity_map(self) -> IdentityMap:
         r"""Proxy for the :attr:`_orm.Session.identity_map` attribute
         on behalf of the :class:`_asyncio.AsyncSession` class.
 
@@ -1458,11 +1566,11 @@ class async_scoped_session(Generic[_AS]):
         return self._proxied.identity_map
 
     @identity_map.setter
-    def identity_map(self, attr: Any) -> None:
+    def identity_map(self, attr: IdentityMap) -> None:
         self._proxied.identity_map = attr
 
     @property
-    def is_active(self) -> Any:
+    def is_active(self) -> bool:
         r"""True if this :class:`.Session` not in "partial rollback" state.
 
         .. container:: class_bases
@@ -1505,7 +1613,7 @@ class async_scoped_session(Generic[_AS]):
         return self._proxied.is_active
 
     @property
-    def autoflush(self) -> Any:
+    def autoflush(self) -> bool:
         r"""Proxy for the :attr:`_orm.Session.autoflush` attribute
         on behalf of the :class:`_asyncio.AsyncSession` class.
 
@@ -1520,7 +1628,7 @@ class async_scoped_session(Generic[_AS]):
         return self._proxied.autoflush
 
     @autoflush.setter
-    def autoflush(self, attr: Any) -> None:
+    def autoflush(self, attr: bool) -> None:
         self._proxied.autoflush = attr
 
     @property
@@ -1559,7 +1667,7 @@ class async_scoped_session(Generic[_AS]):
         return self._proxied.no_autoflush
 
     @property
-    def info(self) -> Any:
+    def info(self) -> _InfoType:
         r"""A user-modifiable dictionary.
 
         .. container:: class_bases
@@ -1585,7 +1693,7 @@ class async_scoped_session(Generic[_AS]):
         return self._proxied.info
 
     @property
-    def execution_options(self) -> Any:
+    def execution_options(self) -> _ExecuteOptions:
         r"""Proxy for the :attr:`_orm.Session.execution_options` attribute
         on behalf of the :class:`_asyncio.AsyncSession` class.
 
@@ -1600,7 +1708,7 @@ class async_scoped_session(Generic[_AS]):
         return self._proxied.execution_options
 
     @execution_options.setter
-    def execution_options(self, attr: Any) -> None:
+    def execution_options(self, attr: _ExecuteOptions) -> None:
         self._proxied.execution_options = attr
 
     @classmethod

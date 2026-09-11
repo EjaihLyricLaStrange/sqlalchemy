@@ -13,6 +13,7 @@ from typing import Dict
 from typing import Generic
 from typing import Iterable
 from typing import Iterator
+from typing import Mapping
 from typing import Optional
 from typing import overload
 from typing import Protocol
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
     from .session import _EntityBindKey
     from .session import _PKIdentityArgument
     from .session import _SessionBind
+    from .session import _SessionBindKey
     from .session import sessionmaker
     from .session import SessionTransaction
     from ..engine import Connection
@@ -62,6 +64,7 @@ if TYPE_CHECKING:
     from ..engine.interfaces import CoreExecuteOptionsParameter
     from ..engine.result import ScalarResult
     from ..sql._typing import _ColumnsClauseArgument
+    from ..sql._typing import _InfoType
     from ..sql._typing import _T0
     from ..sql._typing import _T1
     from ..sql._typing import _T2
@@ -76,6 +79,7 @@ if TYPE_CHECKING:
     from ..sql.roles import TypedColumnsClauseRole
     from ..sql.selectable import ForUpdateParameter
     from ..sql.selectable import TypedReturnsRows
+    from ..util import IdentitySet
 
 
 _T = TypeVar("_T", bound=Any)
@@ -139,6 +143,7 @@ __all__ = ["scoped_session"]
     ],
     attributes=[
         "bind",
+        "binds",
         "dirty",
         "deleted",
         "new",
@@ -1997,7 +2002,20 @@ class scoped_session(Generic[_S]):
         self._proxied.bind = attr
 
     @property
-    def dirty(self) -> Any:
+    def binds(self) -> Mapping[_SessionBindKey, _SessionBind]:
+        r"""Proxy for the :attr:`_orm.Session.binds` attribute
+        on behalf of the :class:`_orm.scoping.scoped_session` class.
+
+        """  # noqa: E501
+
+        return self._proxied.binds
+
+    @binds.setter
+    def binds(self, attr: Mapping[_SessionBindKey, _SessionBind]) -> None:
+        self._proxied.binds = attr
+
+    @property
+    def dirty(self) -> IdentitySet:
         r"""The set of all persistent instances considered dirty.
 
         .. container:: class_bases
@@ -2030,7 +2048,7 @@ class scoped_session(Generic[_S]):
         return self._proxied.dirty
 
     @property
-    def deleted(self) -> Any:
+    def deleted(self) -> IdentitySet:
         r"""The set of all instances marked as 'deleted' within this ``Session``
 
         .. container:: class_bases
@@ -2043,7 +2061,7 @@ class scoped_session(Generic[_S]):
         return self._proxied.deleted
 
     @property
-    def new(self) -> Any:
+    def new(self) -> IdentitySet:
         r"""The set of all instances marked as 'new' within this ``Session``.
 
         .. container:: class_bases
@@ -2069,7 +2087,7 @@ class scoped_session(Generic[_S]):
         self._proxied.identity_map = attr
 
     @property
-    def is_active(self) -> Any:
+    def is_active(self) -> bool:
         r"""True if this :class:`.Session` not in "partial rollback" state.
 
         .. container:: class_bases
@@ -2148,7 +2166,7 @@ class scoped_session(Generic[_S]):
         return self._proxied.no_autoflush
 
     @property
-    def info(self) -> Any:
+    def info(self) -> _InfoType:
         r"""A user-modifiable dictionary.
 
         .. container:: class_bases

@@ -747,7 +747,7 @@ occurs:
 .. _sqlite_on_conflict_multiple:
 
 Specifying Multiple ON CONFLICT Clauses
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 SQLite accepts more than one ``ON CONFLICT`` clause within a single INSERT
 statement.  The :meth:`_sqlite.Insert.on_conflict_do_update` and
@@ -993,6 +993,15 @@ dialect in conjunction with the :class:`_schema.Table` construct:
     Table("some_table", metadata, ..., sqlite_strict=True)
 
   .. versionadded:: 2.0.37
+
+Both options are also reflected, so that a :class:`_schema.Table` which is
+autoloaded from a database that was created using either keyword will render
+that keyword again when the table is recreated.  The reflected values are
+also available directly from
+:meth:`_engine.Inspector.get_table_options`.
+
+.. versionadded:: 2.0.53  Added reflection support for the ``WITHOUT ROWID``
+   and ``STRICT`` table options.
 
 .. seealso::
 
@@ -2147,6 +2156,37 @@ class SQLiteExecutionContext(default.DefaultExecutionContext):
             return colname, None
 
 
+# regexp that locates a FOREIGN KEY clause within the verbatim CREATE TABLE
+# text that sqlite stores in sqlite_master.  the referred-columns group
+# requires a non-empty separator between column tokens; an earlier form made
+# the separator optional, which turned the repeat into a nested quantifier and
+# let a long word run backtrack exponentially.  kept at module level so it can
+# be exercised directly from the tests.
+FK_PATTERN = re.compile(
+    r'(?:CONSTRAINT\s+(?:"(.+?)"|(\w+))\s+)?'
+    r"FOREIGN\s+KEY\s*\(\s*(.+?)\s*\)\s+"
+    r'REFERENCES\s+(?:(?:"(.+?)")|([a-z0-9_]+))\s*\(\s*((?:"[^"]+"|[a-z0-9_]+)(?:(?:\s*,\s*|\s+)(?:"[^"]+"|[a-z0-9_]+))*\s*)\)\s*'  # noqa: E501
+    r"((?:ON\s+(?:DELETE|UPDATE)\s+"
+    r"(?:SET\s+NULL|SET\s+DEFAULT|CASCADE|RESTRICT|"
+    r"NO\s+ACTION)\s*)*)"
+    r"((?:NOT\s+)?DEFERRABLE)?"
+    r"(?:\s+INITIALLY\s+(DEFERRED|IMMEDIATE))?",
+    re.I,
+)
+
+# regexp that locates the table option keywords which may trail the closing
+# paren of the column list in the verbatim CREATE TABLE text.  the match is
+# anchored at the end of the statement, which makes the closing paren
+# unambiguous, as neither keyword can itself contain one.  the keywords may
+# be given in either order; as each may appear only once, the repeated group
+# leaves one named group per keyword holding the text that was matched.
+TABLE_OPTIONS_PATTERN = re.compile(
+    r"\)(?:\s*,?\s*(?:(?P<without_rowid>WITHOUT\s+ROWID)"
+    r"|(?P<strict>STRICT)))*\s*$",
+    re.I,
+)
+
+
 class SQLiteDialect(default.DefaultDialect):
     name = "sqlite"
     supports_alter = False
@@ -2443,6 +2483,29 @@ class SQLiteDialect(default.DefaultDialect):
             )
 
     @reflection.cache
+    def get_table_options(self, connection, table_name, schema=None, **kw):
+        tablesql = self._get_table_sql(
+            connection, table_name, schema=schema, **kw
+        )
+
+        options = {}
+
+        # tablesql is None for the internal sqlite_ tables, which have no
+        # entry in sqlite_master
+        if tablesql is not None:
+            match = TABLE_OPTIONS_PATTERN.search(tablesql.strip())
+            if match:
+                if match.group("without_rowid"):
+                    options["sqlite_with_rowid"] = False
+                if match.group("strict"):
+                    options["sqlite_strict"] = True
+
+        if options:
+            return options
+        else:
+            return ReflectionDefaults.table_options()
+
+    @reflection.cache
     def get_columns(self, connection, table_name, schema=None, **kw):
         pragma = "table_info"
         # computed columns are threaded as hidden, they require table_xinfo
@@ -2714,17 +2777,7 @@ class SQLiteDialect(default.DefaultDialect):
             # FKs, namely the name of the constraint and other options.
             # so parsing the columns is really about matching it up to what
             # we already have.
-            FK_PATTERN = (
-                r'(?:CONSTRAINT\s+(?:"(.+?)"|(\w+))\s+)?'
-                r"FOREIGN\s+KEY\s*\(\s*(.+?)\s*\)\s+"
-                r'REFERENCES\s+(?:(?:"(.+?)")|([a-z0-9_]+))\s*\(\s*((?:(?:"[^"]+"|[a-z0-9_]+)\s*(?:,\s*)?)+)\)\s*'  # noqa: E501
-                r"((?:ON\s+(?:DELETE|UPDATE)\s+"
-                r"(?:SET\s+NULL|SET\s+DEFAULT|CASCADE|RESTRICT|"
-                r"NO\s+ACTION)\s*)*)"
-                r"((?:NOT\s+)?DEFERRABLE)?"
-                r"(?:\s+INITIALLY\s+(DEFERRED|IMMEDIATE))?"
-            )
-            for match in re.finditer(FK_PATTERN, table_data, re.I):
+            for match in FK_PATTERN.finditer(table_data):
                 (
                     constraint_quoted_name,
                     constraint_name,

@@ -34,7 +34,7 @@ versions, Python 3.10 is dropped as of August, 2026 in preparation for Python
 3.10 EOL in October of 2026.   The goal is that no Python versions would need
 to be dropped throughout the release span of the 2.1 series, just as it's been
 with every other SQLAlchemy major release series.   The 1.4 and 2.0 series
-of SQLAlchemy each had four year lifespans which meant they needed to support
+of SQLAlchemy each had four-year lifespans which meant they needed to support
 a very long series of Python releases (3.7 through 3.15 for SQLAlchemy 2.0).
 It's hoped that the 2.1 series will have a little less of a span to support
 by the time it reaches EOL.
@@ -46,12 +46,12 @@ Asyncio "greenlet" dependency no longer installs by default
 
 SQLAlchemy 1.4 and 2.0 used a complex expression to determine if the
 ``greenlet`` dependency, needed by the :ref:`asyncio <asyncio_toplevel>`
-extension, could be installed from pypi using a pre-built wheel instead
+extension, could be installed from PyPI using a pre-built wheel instead
 of having to build from source.   This is because the source build of ``greenlet``
 is not always trivial on some platforms.
 
 Disadvantages to this approach included that SQLAlchemy needed to track
-exactly which versions of ``greenlet`` were published as wheels on pypi;
+exactly which versions of ``greenlet`` were published as wheels on PyPI;
 the setup expression led to problems with some package management tools
 such as ``poetry``; it was not possible to install SQLAlchemy **without**
 ``greenlet`` being installed, even though this is completely feasible
@@ -72,11 +72,11 @@ ORM - New Features
 
 
 Session-level execution options added
---------------------------------------------------------------------------
+-------------------------------------
 
 The :class:`_orm.Session`, :class:`_orm.sessionmaker`,
-:class:`_orm.scoped_session`, :class:`_ext.asyncio.AsyncSession`, and
-:class:`_ext.asyncio.async_sessionmaker` constructors now accept an
+:class:`_orm.scoped_session`, :class:`_asyncio.AsyncSession`, and
+:class:`_asyncio.async_sessionmaker` constructors now accept an
 :paramref:`_orm.Session.execution_options` parameter, which establishes
 a dictionary of execution options that are applied across all operations
 within that session instance. These options are propagated both to
@@ -268,6 +268,38 @@ E.g.::
 
 :ticket:`9832`
 
+.. _change_9147:
+
+Declarative ``__declare_first__()`` and ``__declare_last__()`` use registry events
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The declarative ``__declare_first__()`` and ``__declare_last__()`` hooks are
+now invoked by :meth:`_orm.RegistryEvents.before_configured` and
+:meth:`_orm.RegistryEvents.after_configured` listeners which are established
+when the :class:`_orm.registry` is constructed.  Previously, every mapped
+class making use of these hooks established its own :class:`_orm.Mapper`-wide
+listener, which held a permanent reference to that class, so that the class,
+its :class:`.Table` and its :class:`_orm.Mapper` could never be garbage
+collected.
+
+As the listeners are local to a :class:`_orm.registry`, the hooks are now
+invoked only when that registry is configured, rather than whenever any
+registry in the process is configured, and are not invoked at all for a
+registry that has been disposed.  Applications making use of a single
+:class:`_orm.registry` will see no change in behavior.
+
+The hooks are now located as the class is added to the
+:class:`_orm.registry`, rather than as part of the declarative scan of the
+class.  They therefore also take effect for a class mapped using
+:meth:`_orm.registry.map_imperatively`, where previously they were silently
+ignored.
+
+.. seealso::
+
+    :ref:`declarative_declare_ordering`
+
+:ticket:`9147`
+
 
 .. _change_10050:
 
@@ -298,7 +330,111 @@ lambdas which do the same::
 
 :ticket:`10050`
 
+.. _change_13563:
 
+Session.binds and AsyncSession.binds are public collections
+------------------------------------------------------------
+
+The per-mapper / per-table binds established by the
+:paramref:`_orm.Session.binds` parameter, as well as by the
+:meth:`_orm.Session.bind_mapper` and :meth:`_orm.Session.bind_table` methods,
+are now available publicly as :attr:`_orm.Session.binds`.  The collection was
+previously stored under a private, name-mangled attribute with no public
+accessor::
+
+    session = Session(binds={User: engine})
+
+    session.binds  # {User: engine, users_table: engine}
+
+The keys are normalized from what was originally passed; a mapper or mapped
+class is entered both under the mapped class and under each of its
+selectables, which is why the ``users`` table appears above alongside the
+``User`` class.
+
+The collection is an immutable dictionary, and is replaced rather than
+mutated whenever a new bind is added, so a previously held reference does not
+observe subsequent changes::
+
+    before = session.binds
+
+    session.bind_mapper(Address, engine)
+
+    assert session.binds is not before
+
+AsyncSession binds
+^^^^^^^^^^^^^^^^^^
+
+:attr:`_asyncio.AsyncSession.bind` and :attr:`_asyncio.AsyncSession.binds`
+previously recorded only what was passed to the constructor, and were left
+unset entirely when the corresponding parameter were omitted, so that
+accessing either attribute on a default-constructed
+:class:`_asyncio.AsyncSession` raised ``AttributeError``.  Both are now
+always present::
+
+    async_session = AsyncSession()
+
+    async_session.bind  # None
+    async_session.binds  # {}
+
+Both are now derived from the corresponding collections on the underlying
+:attr:`_asyncio.AsyncSession.sync_session`, with each bind translated back
+into the :class:`_asyncio.AsyncEngine` or :class:`_asyncio.AsyncConnection`
+it was established from.  A bind established after construction is therefore
+reflected as well::
+
+    async_session = AsyncSession()
+
+    async_session.bind = async_engine
+
+    assert async_session.bind is async_engine
+
+    # the synchronous Engine is what's actually established on sync_session
+    assert async_session.sync_session.bind is async_engine.sync_engine
+
+As the keys of :attr:`_asyncio.AsyncSession.binds` are those of the
+sync-side collection, they are normalized in the same way as they are for
+:attr:`_orm.Session.binds`.  Because the collection is derived, it is
+read-only; binds are established by passing the
+:paramref:`_asyncio.AsyncSession.binds` parameter to the constructor.
+
+Along the same lines, the new :meth:`_asyncio.AsyncSession.get_async_bind`
+method is the asyncio-facing counterpart to
+:meth:`_asyncio.AsyncSession.get_bind`, resolving a bind in the same way but
+returning the asyncio object rather than the synchronous one that
+:attr:`_asyncio.AsyncSession.sync_session` uses::
+
+    async_session = AsyncSession(binds={User: async_engine})
+
+    async_session.get_async_bind(User)  # the AsyncEngine
+    async_session.get_bind(User)  # its .sync_engine
+
+The ``bind`` argument is given as an asyncio object as well, and is
+translated on the way in, so that a bind passed explicitly comes back out
+unchanged::
+
+    async_session.get_async_bind(User, bind=some_async_engine)
+    # some_async_engine
+
+Binds added after construction go through the new
+:meth:`_asyncio.AsyncSession.bind_mapper` and
+:meth:`_asyncio.AsyncSession.bind_table` methods, which take asyncio binds
+and are the counterparts to :meth:`_orm.Session.bind_mapper` and
+:meth:`_orm.Session.bind_table`::
+
+    async_session.bind_mapper(User, async_engine)
+    async_session.bind_table(users_table, other_async_engine)
+
+A bind that this :class:`_asyncio.AsyncSession` doesn't know an asyncio
+counterpart for, such as one established directly on
+:attr:`_asyncio.AsyncSession.sync_session`, cannot be translated and raises
+:class:`_asyncio.exc.AsyncBindNotFound`.  Binds should be established on the
+:class:`_asyncio.AsyncSession` itself, so that the asyncio object each one
+was derived from is known.
+
+All of the above are proxied by :class:`_orm.scoping.scoped_session` and
+:class:`_asyncio.async_scoped_session` respectively.
+
+:ticket:`13563`
 
 
 ORM - Behavioral Changes and Improvements
@@ -312,8 +448,8 @@ ORM Mapped Dataclasses no longer populate implicit ``default``, collection-based
 This behavioral change addresses a widely reported issue with SQLAlchemy's
 :ref:`orm_declarative_native_dataclasses` feature that was introduced in 2.0.
 SQLAlchemy ORM has always featured a behavior where a particular attribute on
-an ORM mapped class will have different behaviors depending on if it has an
-actively set value, including if that value is ``None``, versus if the
+an ORM mapped class will have different behaviors depending on whether it
+has an actively set value, including if that value is ``None``, versus if the
 attribute is not set at all.  When Declarative Dataclass Mapping was introduced, the
 :paramref:`_orm.mapped_column.default` parameter introduced a new capability
 which is to set up a dataclass-level default to be present in the generated
@@ -386,8 +522,9 @@ parameters) is directed to be delivered at the
 Python :term:`descriptor` level using mechanisms in SQLAlchemy's attribute
 system that normally return ``None`` for un-populated columns, so that even though the default is not
 populated into ``__dict__``, it's still delivered when the attribute is
-accessed.  This behavior is based on what Python dataclasses itself does
-when a default is indicated for a field that also includes ``init=False``.
+accessed.  This behavior is based on what Python's dataclasses module itself
+does when a default is indicated for a field that also includes
+``init=False``.
 
 In the example below, an immutable default ``"default_status"``
 is applied to a column called ``status``::
@@ -458,14 +595,14 @@ on the instance, delivered via descriptor::
 
     >>> so = SomeObject()
     >>> so.status
-    default_status
+    'default_status'
 
 default_factory for collection-based relationships internally uses DONT_SET
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-A late add to the behavioral change brings equivalent behavior to the
+A late addition to the behavioral change brings equivalent behavior to the
 use of the :paramref:`_orm.relationship.default_factory` parameter with
-collection-based relationships.   This attribute is :ref:`documented <orm_declarative_dc_relationships>`
+collection-based relationships.   This parameter is :ref:`documented <orm_declarative_dc_relationships>`
 as being limited to exactly the collection class that's stated on the left side
 of the annotation, which is now enforced at mapper configuration time::
 
@@ -627,9 +764,9 @@ columns are ``None``::
             return_none_on=lambda x, y: x is None and y is None,
         )
 
-For the above class, any ``Vertex`` instance whether pending or persistent will
-return ``None`` for ``start`` and ``end`` if both composite columns for the attribute
-are ``None``::
+For the above class, any ``Vertex`` instance, whether pending or persistent,
+will return ``None`` for ``start`` and ``end`` if both composite columns for
+the attribute are ``None``::
 
     >>> v1 = Vertex()
     >>> v1.start
@@ -650,8 +787,8 @@ automatically, if not otherwise set explicitly, when using
         start: Mapped[Point | None] = composite(mapped_column("x1"), mapped_column("y1"))
         end: Mapped[Point | None] = composite(mapped_column("x2"), mapped_column("y2"))
 
-The above object will return ``None`` for ``start`` and ``end`` automatically
-if the columns are also None::
+The above class will return ``None`` for ``start`` and ``end`` automatically
+if the columns are also ``None``::
 
     >>> session.scalars(
     ...     select(Vertex.start).where(Vertex.x1 == None, Vertex.y1 == None)
@@ -660,8 +797,8 @@ if the columns are also None::
 
 If :paramref:`_orm.composite.return_none_on` is set explicitly, that value will
 supersede the choice made by ORM Annotated Declarative.   This includes that
-the parameter may be explicitly set to ``None`` which will disable the ORM
-Annotated Declarative setting from taking place.
+the parameter may be explicitly set to ``None``, which disables the setting
+otherwise made by ORM Annotated Declarative.
 
 :ticket:`12570`
 
@@ -781,7 +918,7 @@ the view is created after all dependent tables have been created:
     >>> from sqlalchemy import create_engine
     >>> e = create_engine("sqlite://", echo=True)
     >>> metadata_obj.create_all(e)
-    {opensql}BEGIN (implicit)
+    {execsql}BEGIN (implicit)
 
     CREATE TABLE user_account (
     	id INTEGER NOT NULL,
@@ -803,7 +940,7 @@ The view is usable in SQL expressions via the :attr:`.CreateView.table` attribut
 
     >>> with e.connect() as conn:
     ...     conn.execute(select(view.table))
-    {opensql}BEGIN (implicit)
+    {execsql}BEGIN (implicit)
     SELECT spongebob_view.id, spongebob_view.name, spongebob_view.fullname
     FROM spongebob_view
     <sqlalchemy.engine.cursor.CursorResult object at 0x7f573e4a4ad0>
@@ -826,7 +963,7 @@ executing the object:
 
     >>> with e.begin() as conn:
     ...     conn.execute(create_table_as)
-    {opensql}BEGIN (implicit)
+    {execsql}BEGIN (implicit)
     CREATE TABLE squidward_users AS SELECT user_account.id, user_account.name
     FROM user_account
     WHERE user_account.name = 'squidward'
@@ -838,7 +975,7 @@ Like before, the :class:`.Table` is accessible from :attr:`.CreateTableAs.table`
 
     >>> with e.connect() as conn:
     ...     conn.execute(select(create_table_as.table))
-    {opensql}BEGIN (implicit)
+    {execsql}BEGIN (implicit)
     SELECT squidward_users.id, squidward_users.name
     FROM squidward_users
     <sqlalchemy.engine.cursor.CursorResult object at 0x7f573e4a4f30>
@@ -920,10 +1057,10 @@ needing to modify the construction or compilation code of
 :class:`.Select`, :class:`_dml.Insert`, :class:`.Update`, or :class:`.Delete`
 directly.
 
-Custom extension can be created by subclassing the class
+Custom extensions can be created by subclassing the class
 :class:`sqlalchemy.sql.SyntaxExtension`.
 For example, support for the ``INTO OUTFILE`` clause of a select
-supported by MariaDB and MySQL, can be implemented using syntax extensions
+supported by MariaDB and MySQL can be implemented using syntax extensions
 as follows::
 
     from sqlalchemy.ext.compiler import compiles
@@ -931,7 +1068,7 @@ as follows::
 
 
     def into_outfile(name: str) -> "IntoOutFile":
-        """Return a INTO OUTFILE construct"""
+        """Return an INTO OUTFILE construct"""
         return IntoOutFile(name)
 
 
@@ -975,7 +1112,7 @@ This can then be used in a select using the :meth:`.Select.ext` method:
     {printsql}SELECT a
     FROM tbl INTO OUTFILE 'myfile.txt'{stop}
 
-Several SQLAlchemy features custom to a single backend have been
+Several SQLAlchemy features specific to a single backend have been
 re-implemented using this new system, including PostgreSQL
 :func:`_postgresql.distinct_on` and MySQL :func:`_mysql.limit` functions
 that supersede the previous implementations.
@@ -1015,7 +1152,7 @@ Example usage::
         # not null String column is generated
         name: Named[str]
 
-        # nullable Integer column, the SQL type is manually set SmallInteger
+        # nullable Integer column, the SQL type is manually set to SmallInteger
         age: Named[int | None] = Column(SmallInteger)
 
         # optional, used to infer the select types when selecting the table
@@ -1039,8 +1176,9 @@ them directly, like ``id``, by using only a type annotation, like ``name``, lett
 the :class:`_schema.Table` infer SQL type and nullability, or by mixing the two, like ``age``,
 to provide explicit column options while inferring nullability and/or SQL type.
 
-Other :class:`_sql.FromClause`, like :class:`_sql.Join`, :class:`_sql.CTE`, etc, can be made
-generic using the :meth:`_sql.FromClause.with_cols` method::
+Other :class:`_sql.FromClause` subclasses, like :class:`_sql.Join`,
+:class:`_sql.CTE`, etc., can be made generic using the
+:meth:`_sql.FromClause.with_cols` method::
 
     # using with_cols the ``c`` collection of the cte has typed columns
     cte = user.select().cte().with_cols(user_cols)
@@ -1230,7 +1368,7 @@ period but will emit deprecation warnings.
 
 SQLAlchemy 2.0 implemented a broad array of :pep:`484` typing throughout
 all components, including a new ability for row-returning statements such
-as :func:`_sql.select` to maintain track of individual column types, which
+as :func:`_sql.select` to keep track of individual column types, which
 were then passed through the execution phase onto the :class:`_engine.Result`
 object and then to the individual :class:`_engine.Row` objects.   Described
 at :ref:`change_result_typing_20`, this approach solved several issues
@@ -1431,7 +1569,7 @@ A column may likewise be named more than once on the referenced side, such as
 that its ``a`` and ``b`` values are equal.  This form has always been accepted
 by :class:`.ForeignKeyConstraint` and is likewise emitted in DDL and reflected;
 support for it is unchanged, and the two forms may be combined.  Backends vary
-in whether they accept either form, as a foreign key requires a unique
+in whether they accept these forms, since a foreign key requires a unique
 constraint on the referenced columns.
 
 Additionally, the check that the number of constrained columns matches the
@@ -1529,7 +1667,7 @@ Where the above URL correctly round-trips to itself::
 
 Whereas previously, special characters applied programmatically would not
 be escaped in the result, leading to a URL that does not represent the
-original database portion.  Below, `b=c` is part of the query string and
+original database portion.  Below, ``b=c`` is part of the query string and
 not the database portion::
 
     >>> # pre-2.1 behavior
@@ -1564,7 +1702,7 @@ with the same-named method that is defined by the PostgreSQL
 operators. Because :class:`_types.JSON` data is normally stored as a plain string,
 :meth:`.ColumnOperators.contains` would "work", and even in trivial cases
 behave similarly to that of :class:`_postgresql.JSONB`. However, since the two
-operations are not actually compatible at all, this mis-use can easily lead to
+operations are not actually compatible at all, this misuse can easily lead to
 unexpected inconsistencies.
 
 Code that uses :meth:`.ColumnOperators.contains` with :class:`_types.JSON` columns will
@@ -1609,21 +1747,21 @@ The operator class system involves a mapping of SQLAlchemy operators listed
 out in :mod:`sqlalchemy.sql.operators` to operator class combinations that come
 from the :class:`.OperatorClass` enumeration, which are reconciled at
 expression construction time with datatypes using the
-:attr:`.TypeEngine.operator_classes` attribute.  A custom user defined type
+:attr:`.TypeEngine.operator_classes` attribute.  A custom user-defined type
 may want to set this attribute to indicate the kinds of operators that make
 sense::
 
+    from sqlalchemy.types import OperatorClass
     from sqlalchemy.types import UserDefinedType
-    from sqlalchemy.sql.sqltypes import OperatorClass
 
 
     class ComplexNumber(UserDefinedType):
         operator_classes = OperatorClass.MATH
 
 The above ``ComplexNumber`` datatype would then validate that operators
-used are included in the "math" operator class.   By default, user defined
+used are included in the "math" operator class.   By default, user-defined
 types made with :class:`.UserDefinedType` are left open to accept all
-operators by default, whereas classes defined with :class:`.TypeDecorator`
+operators, whereas classes defined with :class:`.TypeDecorator`
 will make use of the operator classes declared by the "impl" type.
 
 .. seealso::
@@ -1728,7 +1866,7 @@ Examples to summarize the change are as follows::
 The ``psycopg`` DBAPI driver itself can be installed either directly
 or via the ``sqlalchemy[postgresql]`` extra:
 
-.. sourcecode:: txt
+.. sourcecode:: text
 
     # install psycopg directly
     pip install "psycopg[binary]"
@@ -1756,7 +1894,7 @@ Named Types are Now Associated with MetaData
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Named types are now more strongly associated with the :class:`_schema.MetaData`
-at the top of the table hierarchy and are de-associated with any particular
+at the top of the table hierarchy and are disassociated from any particular
 :class:`_schema.Table` they may be a part of. This better represents how
 PostgreSQL named types exist independently of any particular table, and that
 they may be used across many tables simultaneously.
@@ -1821,7 +1959,7 @@ There is also newly refined "checkfirst" behavior. A new enumeration
 :class:`_schema.CheckFirst` is introduced which allows fine-grained control
 within :meth:`_schema.MetaData.create_all`, :meth:`_schema.MetaData.drop_all`,
 :meth:`_schema.Table.create`, and :meth:`_schema.Table.drop` as to what "check"
-queries are emitted, allowing tests for types, sequences etc. to be included
+queries are emitted, allowing tests for types, sequences, etc. to be included
 or not::
 
     from sqlalchemy import CheckFirst
@@ -1845,6 +1983,8 @@ to set :paramref:`_types.Enum.schema` directly as desired when the schema
 used by the :class:`.MetaData` is not what's desired.
 
 :ticket:`10594`
+
+.. _change_12866:
 
 Support for ``VIRTUAL`` computed columns
 ----------------------------------------
@@ -1873,6 +2013,8 @@ To maintain the previous behavior of ``STORED`` computed columns,
         Column("x^2", Integer, Computed("x * x", persisted=True)),
     )
 
+:ticket:`12866`
+
 .. _change_10556:
 
 Addition of ``BitString`` subclass for handling postgresql ``BIT`` columns
@@ -1881,7 +2023,7 @@ Addition of ``BitString`` subclass for handling postgresql ``BIT`` columns
 Values of :class:`_postgresql.BIT` columns in the PostgreSQL dialect are
 returned as instances of a new ``str`` subclass,
 :class:`_postgresql.BitString`.  Previously, the value of :class:`_postgresql.BIT`
-columns was driver dependent, with most drivers returning ``str`` instances
+columns was driver-dependent, with most drivers returning ``str`` instances
 except ``asyncpg``, which used ``asyncpg.BitString``.
 
 With this change, for the ``psycopg``, ``psycopg2``, and ``pg8000`` drivers,
@@ -1918,7 +2060,7 @@ operator syntax automatically, ensuring backward compatibility.
 
 Example of the new syntax when connected to PostgreSQL 14+::
 
-    from sqlalchemy import table, column, update
+    from sqlalchemy import table, column, select, update
     from sqlalchemy.dialects.postgresql import HSTORE
 
     data = table("data", column("h", HSTORE))
@@ -2187,11 +2329,11 @@ Improved reflection performance via native multi-table queries
 --------------------------------------------------------------
 
 The SQL Server dialect now implements native bulk reflection methods,
-including :meth:`.MSDialect.get_multi_columns`,
-:meth:`.MSDialect.get_multi_pk_constraint`,
-:meth:`.MSDialect.get_multi_foreign_keys`,
-:meth:`.MSDialect.get_multi_indexes`, and
-:meth:`.MSDialect.get_multi_table_comment`.  Previously, the SQL Server
+including :meth:`_reflection.Inspector.get_multi_columns`,
+:meth:`_reflection.Inspector.get_multi_pk_constraint`,
+:meth:`_reflection.Inspector.get_multi_foreign_keys`,
+:meth:`_reflection.Inspector.get_multi_indexes`, and
+:meth:`_reflection.Inspector.get_multi_table_comment`.  Previously, the SQL Server
 dialect fell back to the default implementation which calls the per-table
 single-reflection methods in a loop, resulting in one round-trip per table
 per object type.  The new implementations issue a single bulk query per
@@ -2264,9 +2406,9 @@ DDL ``BOOLEAN`` when Oracle Database 23c or higher is used.
 The :class:`.BOOLEAN` exact datatype may also be used with Oracle
 Database.    For earlier versions, the :class:`.Boolean` emulated
 type will still produce ``SMALLINT`` in DDL and convert between Boolean
-and integer.   An Oracle database that uses ``SMALLINT`` with emulation
-on version 23c or above will also function correctly when using
-the :class:`.Boolean` datatype.
+and integer.   Existing ``SMALLINT`` columns that were created under the
+emulated form continue to function correctly with the :class:`.Boolean`
+datatype after upgrading to version 23c or above.
 
 .. seealso::
 
@@ -2277,12 +2419,14 @@ the :class:`.Boolean` datatype.
 SQLite
 ======
 
-Added :class:`_sqlite.JSONB` json format for SQLite
+.. _change_13260:
+
+Added :class:`_sqlite.JSONB` JSON format for SQLite
 ---------------------------------------------------
 
-SQLite version 3.45 added support for serializing json using
+SQLite version 3.45 added support for serializing JSON using
 a binary format called ``JSONB``, which provides improved performance
-and storage saving. The new :class:`_sqlite.JSONB` type provides support
+and storage savings. The new :class:`_sqlite.JSONB` type provides support
 for this format, ensuring that the data is correctly serialized
 when inserting and deserialized when querying.
 
