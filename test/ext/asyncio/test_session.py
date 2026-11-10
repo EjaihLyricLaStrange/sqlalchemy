@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy import Sequence
 from sqlalchemy import String
 from sqlalchemy import testing
+from sqlalchemy import text
 from sqlalchemy import update
 from sqlalchemy.ext.asyncio import async_object_session
 from sqlalchemy.ext.asyncio import async_scoped_session
@@ -25,6 +26,7 @@ from sqlalchemy.ext.asyncio import close_all_sessions
 from sqlalchemy.ext.asyncio import exc as async_exc
 from sqlalchemy.ext.asyncio.base import ReversibleProxy
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.orm import joinedload
 from sqlalchemy.orm import Mapped
 from sqlalchemy.orm import mapped_column
 from sqlalchemy.orm import relationship
@@ -519,6 +521,23 @@ class AsyncSessionQueryTest(AsyncFixture):
             result = await (await async_session.stream_scalars(stmt)).all()
         eq_(result, self.static.user_address_result)
 
+    @testing.combinations(("execute",), ("stream",), argnames="method")
+    @async_test
+    async def test_joinedload_unique_scalars(self, async_session, method):
+        """test #13688"""
+        User = self.classes.User
+
+        stmt = (
+            select(User).options(joinedload(User.addresses)).order_by(User.id)
+        )
+
+        if method == "execute":
+            result = (await async_session.execute(stmt)).unique().scalars()
+            eq_(result.all(), self.static.user_address_result)
+        elif method == "stream":
+            result = (await async_session.stream(stmt)).unique().scalars()
+            eq_(await result.all(), self.static.user_address_result)
+
     @async_test
     async def test_get(self, async_session):
         User = self.classes.User
@@ -606,6 +625,35 @@ class AsyncSessionQueryTest(AsyncFixture):
             ],
         )
 
+    @async_test
+    @testing.variation("entity", ["single", "multiple"])
+    async def test_stream_freeze(self, async_session, entity):
+        User = self.classes.User
+
+        if entity.single:
+            stmt = select(User).order_by(User.id)
+        elif entity.multiple:
+            stmt = select(User, User.name).order_by(User.id)
+        else:
+            entity.fail()
+
+        result = await async_session.stream(stmt)
+        frozen = await result.freeze()
+
+        for _ in range(2):
+            if entity.single:
+                eq_(frozen().scalars().all(), self.static.user_result)
+            else:
+                eq_(
+                    frozen().all(),
+                    list(
+                        zip(
+                            self.static.user_result,
+                            ["jack", "ed", "fred", "chuck"],
+                        )
+                    ),
+                )
+
     @testing.combinations("statement", "execute", argnames="location")
     @async_test
     @testing.requires.server_side_cursors
@@ -632,6 +680,79 @@ class AsyncSessionQueryTest(AsyncFixture):
 
 class AsyncSessionTransactionTest(AsyncFixture):
     run_inserts = None
+
+    def _assert_recreates_connections(self, trans):
+        eq_(
+            {
+                key: conn
+                for key, (conn, _, _, _) in (
+                    trans.sync_transaction._connections.items()
+                )
+            },
+            {
+                key: conn.sync_connection
+                for conn in trans.connections
+                for key in (conn.sync_connection, conn.sync_engine)
+            },
+        )
+
+    @async_test
+    async def test_connections_engine_bind(self, async_engine):
+        async with AsyncSession(async_engine) as sess:
+            trans = await sess.begin()
+
+            eq_(trans.connections, frozenset())
+            with expect_raises_message(
+                exc.InvalidRequestError, "has not acquired a connection"
+            ):
+                trans.bound_connection()
+
+            conn = await sess.connection()
+
+            eq_(trans.connections, frozenset([conn]))
+            is_(trans.bound_connection(), conn)
+            is_(sess.get_transaction().bound_connection(), conn)
+            self._assert_recreates_connections(trans)
+
+    @async_test
+    async def test_connections_connection_bind(self, async_engine):
+        async with async_engine.connect() as aconn:
+            async with AsyncSession(aconn) as sess:
+                await sess.execute(text("select 1"))
+                trans = sess.get_transaction()
+
+                eq_(trans.connections, frozenset([aconn]))
+                is_(trans.bound_connection(), aconn)
+                self._assert_recreates_connections(trans)
+
+    @async_test
+    async def test_bound_connection_async_bind(self, async_engine):
+        async with async_engine.connect() as aconn:
+            async with AsyncSession(async_engine) as sess:
+                conn = await sess.connection()
+                trans = sess.get_transaction()
+
+                is_(trans.bound_connection(bind=async_engine), conn)
+                with expect_raises_message(
+                    exc.InvalidRequestError, "has not acquired a connection"
+                ):
+                    trans.bound_connection(bind=aconn)
+
+    @async_test
+    async def test_connections_invalidated(self):
+        async_engine = engines.testing_engine(asyncio=True)
+        try:
+            async with AsyncSession(async_engine) as sess:
+                conn = await sess.connection()
+                await conn.invalidate()
+                trans = sess.get_transaction()
+
+                is_true(trans.is_active)
+                eq_(trans.connections, frozenset([conn]))
+                is_true(trans.bound_connection().invalidated)
+                await sess.rollback()
+        finally:
+            await async_engine.dispose()
 
     @async_test
     async def test_interrupt_ctxmanager_connection(

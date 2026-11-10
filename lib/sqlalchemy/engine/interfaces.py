@@ -560,7 +560,7 @@ class ReflectedIndex(TypedDict):
     """
 
     dialect_options: NotRequired[Dict[str, Any]]
-    """Additional dialect-specific options detected for this index"""
+    """Additional dialect-specific options detected for this index."""
 
 
 class ReflectedTableComment(TypedDict):
@@ -1259,6 +1259,17 @@ class Dialect(EventTarget):
     here is so that third-party dialects that haven't yet implemented this
     feature continue to function in the old way.
 
+    Arguments that represent database state without any corresponding DDL,
+    but may nonetheless appear in a reflected set of arguments that should
+    be ignored by the construct, may make use of the
+    :attr:`.DialectKWArgConst.REFLECTED_ONLY` token as the default value.
+    Arguments passed to the schema object on such a key will be passed along
+    into the separate read-only collection
+    :attr:`.DialectKWArgs.reflect_only_elements` and should be omitted from
+    DDL rendering.
+
+    .. versionadded:: 2.1 Added :class:`.DialectKWArgConst`.
+
     .. seealso::
 
         :class:`.DialectKWArgs` - implementing base class which consumes
@@ -1449,6 +1460,23 @@ class Dialect(EventTarget):
 
         The returned result is cached *per dialect class* so can
         contain no dialect-instance state.
+
+        """
+
+        raise NotImplementedError()
+
+    def min_year_for_type(self, typeobj: TypeEngine[Any]) -> int:
+        """Return the earliest year the database accepts for the given
+        date or datetime type.
+
+        The type may be a generic type such as :class:`.DateTime`, in
+        which case the limit is that of the database type the dialect
+        renders for it.  Dialects whose date or datetime types don't
+        accept all years from ``datetime.MINYEAR`` forward override this
+        method; e.g. SQL Server's ``DATETIME`` type, which the dialect
+        renders for :class:`.DateTime`, accepts years from 1753 forward.
+
+        .. versionadded:: 2.0.55
 
         """
 
@@ -3426,7 +3454,8 @@ class ExceptionContext:
 
     """
 
-    __slots__ = ()
+    if not TYPE_CHECKING:
+        __slots__ = ()
 
     dialect: Dialect
     """The :class:`_engine.Dialect` in use.

@@ -961,10 +961,12 @@ class FromClause(
             )
 
             # assigning these three collections separately is not itself
-            # atomic, but greatly reduces the surface for problems
-            self._columns = _columns
+            # atomic, but greatly reduces the surface for problems.
+            # _columns is assigned last, as its presence is what signals
+            # to other threads that all three collections are present
             self.primary_key = primary_key  # type: ignore[misc]
             self.foreign_keys = foreign_keys  # type: ignore[assignment, misc]
+            self._columns = _columns
 
     @util.ro_non_memoized_property
     def entity_namespace(self) -> _EntityNamespace:
@@ -1654,6 +1656,19 @@ class Join(roles.DMLTableRole, FromClause[_KeyColCC_co]):
         """
         return Select(self.left, self.right).select_from(self)
 
+    @staticmethod
+    def _flat_element_name(
+        name: Optional[str], element: FromClause
+    ) -> Optional[str]:
+        if name and isinstance(element, NamedFromClause):
+            if isinstance(element.name, _anonymous_label):
+                # an anonymous name can't be embedded within a new name;
+                # alias the element anonymously, #13583
+                return None
+            return f"{name}_{element.name}"
+        else:
+            return name
+
     @util.preload_module("sqlalchemy.sql.util")
     def _anonymous_fromclause(
         self, name: Optional[str] = None, flat: bool = False
@@ -1663,17 +1678,11 @@ class Join(roles.DMLTableRole, FromClause[_KeyColCC_co]):
             if isinstance(self.left, (FromGrouping, Join)):
                 left_name = name  # will recurse
             else:
-                if name and isinstance(self.left, NamedFromClause):
-                    left_name = f"{name}_{self.left.name}"
-                else:
-                    left_name = name
+                left_name = self._flat_element_name(name, self.left)
             if isinstance(self.right, (FromGrouping, Join)):
                 right_name = name  # will recurse
             else:
-                if name and isinstance(self.right, NamedFromClause):
-                    right_name = f"{name}_{self.right.name}"
-                else:
-                    right_name = name
+                right_name = self._flat_element_name(name, self.right)
             left_a, right_a = (
                 self.left._anonymous_fromclause(name=left_name, flat=flat),
                 self.right._anonymous_fromclause(name=right_name, flat=flat),
@@ -2291,7 +2300,10 @@ class CTE(
             name=name,
             recursive=self.recursive,
             nesting=self.nesting,
-            _cte_alias=self,
+            # an alias of an alias refers to the original CTE, #13583
+            _cte_alias=(
+                self._cte_alias if self._cte_alias is not None else self
+            ),
             _prefixes=self._prefixes,
             _suffixes=self._suffixes,
         )
@@ -5076,32 +5088,55 @@ class SelectState(util.MemoizedSlots, CompileState):
         correlating.
 
         """
+        statement = self.statement
+        return self._correlate_froms(
+            self.froms,
+            statement,
+            statement._correlate,
+            statement._correlate_except,
+            statement._auto_correlate,
+            explicit_correlate_froms,
+            implicit_correlate_froms,
+        )
 
-        froms = self.froms
+    @classmethod
+    def _correlate_froms(
+        cls,
+        froms: List[FromClause],
+        statement: Select[Unpack[TupleAny]],
+        to_correlate: Optional[Sequence[FromClause]],
+        to_correlate_except: Optional[Sequence[FromClause]],
+        auto_correlate: bool,
+        explicit_correlate_froms: Optional[Sequence[FromClause]],
+        implicit_correlate_froms: Optional[Sequence[FromClause]],
+    ) -> List[FromClause]:
+        """Given a list of FROM clauses and correlation settings, return
+        the list of FROM clauses that remain after correlation.
 
-        if self.statement._correlate:
-            to_correlate = self.statement._correlate
-            if to_correlate:
-                to_remove = _cloned_intersection(
-                    _cloned_intersection(
-                        froms, explicit_correlate_froms or ()
-                    ),
-                    to_correlate,
-                )
-                froms = [f for f in froms if f not in to_remove]
+        This is the implementation for :meth:`.SelectState._get_display_froms`
+        that is also used by the ORM, which needs to know which FROM clauses
+        will be correlated before it has generated the final statement.
 
-        if self.statement._correlate_except is not None:
-            to_remove = _cloned_difference(
+        For ``explicit_correlate_froms`` and ``implicit_correlate_froms``,
+        see :meth:`.SQLCompiler._enclosing_correlate_froms`.
+
+        """
+
+        if to_correlate:
+            to_remove = _cloned_intersection(
                 _cloned_intersection(froms, explicit_correlate_froms or ()),
-                self.statement._correlate_except,
+                to_correlate,
             )
             froms = [f for f in froms if f not in to_remove]
 
-        if (
-            self.statement._auto_correlate
-            and implicit_correlate_froms
-            and len(froms) > 1
-        ):
+        if to_correlate_except is not None:
+            to_remove = _cloned_difference(
+                _cloned_intersection(froms, explicit_correlate_froms or ()),
+                to_correlate_except,
+            )
+            froms = [f for f in froms if f not in to_remove]
+
+        if auto_correlate and implicit_correlate_froms and len(froms) > 1:
             to_remove = _cloned_intersection(froms, implicit_correlate_froms)
             froms = [f for f in froms if f not in to_remove]
 
@@ -5112,7 +5147,7 @@ class SelectState(util.MemoizedSlots, CompileState):
                     "due to auto-correlation; "
                     "specify correlate(<tables>) "
                     "to control correlation "
-                    "manually." % self.statement
+                    "manually." % statement
                 )
 
         return froms
@@ -5557,6 +5592,7 @@ class Select(
             ("_setup_joins", InternalTraversal.dp_setup_join_tuple),
             ("_correlate", InternalTraversal.dp_clauseelement_tuple),
             ("_correlate_except", InternalTraversal.dp_clauseelement_tuple),
+            ("_correlate_mode", InternalTraversal.dp_plain_obj),
             ("_limit_clause", InternalTraversal.dp_clauseelement),
             ("_offset_clause", InternalTraversal.dp_clauseelement),
             ("_fetch_clause", InternalTraversal.dp_clauseelement),
@@ -5584,6 +5620,27 @@ class Select(
     ]
 
     _compile_state_factory: Type[SelectState]
+
+    @property
+    def _correlate_mode(self) -> Optional[str]:
+        """Correlation state not otherwise captured by ``_correlate`` and
+        ``_correlate_except``, for comparison and cache key purposes.
+
+        ``None`` for the default of auto-correlation; ``"explicit"`` once
+        correlate() or correlate_except() has been called, which includes
+        correlate(None) that disables correlation; ``"except_all"`` when
+        correlate_except() was called with no FROM objects, which
+        correlates all FROM objects to enclosing SELECTs.  The latter two
+        are otherwise indistinguishable from the default, as the cache key
+        omits empty ``_correlate`` / ``_correlate_except`` tuples.
+
+        """
+        if self._auto_correlate:
+            return None
+        elif self._correlate_except == ():
+            return "except_all"
+        else:
+            return "explicit"
 
     @classmethod
     def _create_raw_select(cls, **kw: Any) -> Select[Unpack[TupleAny]]:

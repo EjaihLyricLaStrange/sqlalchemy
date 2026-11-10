@@ -68,6 +68,7 @@ from sqlalchemy import true
 from sqlalchemy import try_cast
 from sqlalchemy import tuple_
 from sqlalchemy import type_coerce
+from sqlalchemy import TypeDecorator
 from sqlalchemy import types
 from sqlalchemy import union
 from sqlalchemy import union_all
@@ -4862,7 +4863,10 @@ class BindParameterTest(AssertsCompiledSQL, fixtures.TestBase):
             to_update,
             replacement_expr,
         ) = compiled._literal_execute_expanding_parameter(
-            "param_1", expr.right, [(1, "foo"), (5, "bar")]
+            "param_1",
+            expr.right,
+            [(1, "foo"), (5, "bar")],
+            taken_names=set(),
         )
         eq_(
             to_update,
@@ -4898,7 +4902,10 @@ class BindParameterTest(AssertsCompiledSQL, fixtures.TestBase):
             to_update,
             replacement_expr,
         ) = compiled._literal_execute_expanding_parameter(
-            "param_1", expr.right, [(1, "foo"), (5, "bar")]
+            "param_1",
+            expr.right,
+            [(1, "foo"), (5, "bar")],
+            taken_names=set(),
         )
         eq_(
             to_update,
@@ -4913,6 +4920,145 @@ class BindParameterTest(AssertsCompiledSQL, fixtures.TestBase):
             replacement_expr,
             "VALUES (:param_1_1_1, :param_1_1_2), "
             "(:param_1_2_1, :param_1_2_2)",
+        )
+
+    @testing.variation("paramstyle", ["named", "qmark", "numeric"])
+    @testing.variation("in_first", [True, False])
+    def test_expanding_element_name_collides_w_anon_bind(
+        self, paramstyle, in_first
+    ):
+        """test #13695
+
+        the expanding parameter for ``x`` is named ``x_1``, so its first
+        element is ``x_1_1``, which is also the anonymous name of the
+        parameter compared to the column ``x_1``.   The element is given a
+        different name, rather than the element value replacing the value
+        of the other parameter.
+
+        """
+        t = table("t", column("x"), column("x_1"))
+
+        in_crit = t.c.x.in_([1, 2])
+        eq_crit = t.c.x_1 == 5
+        if in_first:
+            stmt = select(t.c.x).where(in_crit, eq_crit)
+        else:
+            stmt = select(t.c.x).where(eq_crit, in_crit)
+
+        compiled = stmt.compile(
+            dialect=default.DefaultDialect(paramstyle=paramstyle.name)
+        )
+        es = compiled.construct_expanded_state()
+
+        eq_(es.parameters, {"x_1_1": 5, "x_1_1__1": 1, "x_1_2": 2})
+        eq_(es.parameter_expansion, {"x_1": ["x_1_1__1", "x_1_2"]})
+
+        if paramstyle.named:
+            in_sql, eq_sql = "t.x IN (:x_1_1__1, :x_1_2)", "t.x_1 = :x_1_1"
+            is_none(es.positiontup)
+        elif paramstyle.qmark:
+            in_sql, eq_sql = "t.x IN (?, ?)", "t.x_1 = ?"
+            eq_(es.positional_parameters, (1, 2, 5) if in_first else (5, 1, 2))
+        elif paramstyle.numeric:
+            # expanded parameters are numbered after the others
+            in_sql, eq_sql = "t.x IN (:2, :3)", "t.x_1 = :1"
+            eq_(es.positional_parameters, (5, 1, 2))
+        else:
+            paramstyle.fail()
+
+        eq_ignore_whitespace(
+            es.statement,
+            "SELECT t.x FROM t WHERE %s AND %s"
+            % ((in_sql, eq_sql) if in_first else (eq_sql, in_sql)),
+        )
+
+    def test_expanding_element_name_collides_w_named_bind(self):
+        """test #13695 with explicitly named parameters"""
+
+        t = table("t", column("x"), column("data"))
+
+        stmt = select(t.c.x).where(
+            t.c.x.in_(bindparam("q", [1, 2], expanding=True)),
+            t.c.data == bindparam("q_1", 5),
+        )
+
+        self.assert_compile(
+            stmt,
+            "SELECT t.x FROM t WHERE t.x IN (:q_1__1, :q_2) "
+            "AND t.data = :q_1",
+            checkparams={"q_1": 5, "q_1__1": 1, "q_2": 2},
+            render_postcompile=True,
+        )
+
+    def test_expanding_element_name_collides_w_expanding(self):
+        """test #13695 where the colliding parameter is itself expanding.
+
+        Previously the element ``q_1`` of ``q`` replaced the list value of
+        the parameter ``q_1`` before it was expanded.
+
+        """
+        t = table("t", column("x"), column("data"))
+
+        stmt = select(t.c.x).where(
+            t.c.x.in_(bindparam("q", [1, 2], expanding=True)),
+            t.c.data.in_(bindparam("q_1", [5, 6], expanding=True)),
+        )
+
+        self.assert_compile(
+            stmt,
+            "SELECT t.x FROM t WHERE t.x IN (:q_1__1, :q_2) "
+            "AND t.data IN (:q_1_1, :q_1_2)",
+            checkparams={"q_1__1": 1, "q_2": 2, "q_1_1": 5, "q_1_2": 6},
+            render_postcompile=True,
+        )
+
+    def test_expanding_element_name_collides_tuple_elements(self):
+        """test #13695 where elements of two expanding parameters collide.
+
+        The tuple element ``q_1_1`` of ``q`` and the element ``q_1_1`` of
+        ``q_1`` are both generated names.  Bind processors apply to the
+        elements under their uniquified names.
+
+        """
+
+        class Proc(TypeDecorator):
+            impl = Integer
+            cache_ok = True
+
+            def process_bind_param(self, value, dialect):
+                return value * 10
+
+        t = table("t", column("x", Proc()), column("data", Proc()))
+
+        stmt = select(t.c.x).where(
+            tuple_(t.c.x, t.c.data).in_(bindparam("q", expanding=True)),
+            t.c.data.in_(bindparam("q_1", expanding=True)),
+        )
+
+        compiled = stmt.compile()
+        es = compiled.construct_expanded_state(
+            {"q": [(1, 2), (3, 4)], "q_1": [5, 6]}
+        )
+
+        eq_ignore_whitespace(
+            es.statement,
+            "SELECT t.x FROM t WHERE (t.x, t.data) IN "
+            "((:q_1_1, :q_1_2), (:q_2_1, :q_2_2)) "
+            "AND t.data IN (:q_1_1__1, :q_1_2__1)",
+        )
+        eq_(
+            {
+                key: es.processors[key](value)
+                for key, value in es.parameters.items()
+            },
+            {
+                "q_1_1": 10,
+                "q_1_2": 20,
+                "q_2_1": 30,
+                "q_2_2": 40,
+                "q_1_1__1": 50,
+                "q_1_2__1": 60,
+            },
         )
 
     def test_construct_params_repeated_postcompile_params_one(self):
@@ -5624,6 +5770,81 @@ class BindParameterTest(AssertsCompiledSQL, fixtures.TestBase):
             "AND mytable.myid IN ($2, $3)",
             checkpositional=("a", 1, 2),
             dialect=default.DefaultDialect(paramstyle="numeric_dollar"),
+            render_postcompile=True,
+        )
+
+    @testing.combinations(
+        ("qmark", "?", "'%(k)s'"),
+        ("format", "%s", "'%%(k)s'"),
+        ("numeric", ":1", "'%(k)s'"),
+        ("numeric_dollar", "$1", "'%(k)s'"),
+        argnames="paramstyle, bind, literal",
+    )
+    def test_pyformat_like_literal_positional(self, paramstyle, bind, literal):
+        """test #13609"""
+
+        dialect = default.DefaultDialect(paramstyle=paramstyle)
+
+        self.assert_compile(
+            select(table1.c.name).where(table1.c.name == "%(k)s"),
+            "SELECT mytable.name FROM mytable "
+            f"WHERE mytable.name = {literal}",
+            dialect=dialect,
+            literal_binds=True,
+        )
+
+        self.assert_compile(
+            text("SELECT '%(k)s' WHERE x = :p").bindparams(p=5),
+            f"SELECT {literal} WHERE x = {bind}",
+            checkpositional=(5,),
+            dialect=dialect,
+        )
+
+        self.assert_compile(
+            select(table1.c.name).where(
+                table1.c.name == literal_column("'%(k)s'"),
+                table1.c.myid == 5,
+            ),
+            f"SELECT mytable.name FROM mytable WHERE mytable.name = {literal} "
+            f"AND mytable.myid = {bind}",
+            checkpositional=(5,),
+            dialect=dialect,
+        )
+
+    def test_escaped_percent_adjacent_to_bind_format(self):
+        """test #13609; an escaped percent sign immediately followed by a
+        bound parameter"""
+
+        self.assert_compile(
+            text("SELECT 5%:p, '%(k)s%'").bindparams(p=5),
+            "SELECT 5%%%s, '%%(k)s%%'",
+            checkpositional=(5,),
+            dialect=default.DefaultDialect(paramstyle="format"),
+        )
+
+    @testing.combinations(
+        ("qmark", "?", "'%(k)s'"),
+        ("format", "%s", "'%%(k)s'"),
+        ("numeric", ":1", "'%(k)s'"),
+        ("numeric_dollar", "$1", "'%(k)s'"),
+        argnames="paramstyle, bind, literal",
+    )
+    def test_pyformat_like_literal_execute_positional(
+        self, paramstyle, bind, literal
+    ):
+        """test #13609"""
+
+        self.assert_compile(
+            select(table1.c.name).where(
+                table1.c.name.in_(
+                    bindparam("q", ["%(k)s"], literal_execute=True)
+                ),
+                table1.c.myid == 5,
+            ),
+            "SELECT mytable.name FROM mytable "
+            f"WHERE mytable.name IN ({literal}) AND mytable.myid = {bind}",
+            checkpositional=(5,),
+            dialect=default.DefaultDialect(paramstyle=paramstyle),
             render_postcompile=True,
         )
 
@@ -7052,31 +7273,64 @@ class DDLTest(fixtures.TestBase, AssertsCompiledSQL):
             "INITIALLY DEFERRED",
         )
 
-    def test_fk_illegal_sql_phrases(self):
+    @testing.combinations(
+        ("ondelete", "ON DELETE"),
+        ("onupdate", "ON UPDATE"),
+        ("initially", "INITIALLY"),
+        ("match", "MATCH"),
+        argnames="kw, rendered",
+    )
+    @testing.combinations(
+        "CASCADE",
+        "SET NULL",
+        "set  default",
+        "SOME FUTURE KEYWORD",
+        argnames="phrase",
+    )
+    def test_fk_keyword_phrases(self, kw, rendered, phrase):
+        """keyword phrases are rendered as is; the backend decides if the
+        keywords are valid"""
+
         a = Table("a", MetaData(), Column("q", Integer))
         b = Table("b", MetaData(), Column("p", Integer))
 
-        for kw in ("onupdate", "ondelete", "initially"):
-            for phrase in (
-                "NOT SQL",
-                "INITIALLY NOT SQL",
-                "FOO RESTRICT",
-                "CASCADE WRONG",
-                "SET  NULL",
-                # test that PostgreSQL's syntax added in #11595 is not
-                # accepted by base compiler
-                "SET NULL(postgresql_db.some_column)",
-            ):
-                const = schema.AddConstraint(
-                    schema.ForeignKeyConstraint(
-                        [a.c.q], [b.c.p], **{kw: phrase}
-                    )
-                )
-                assert_raises_message(
-                    exc.CompileError,
-                    rf"Unexpected SQL phrase: '{re.escape(phrase)}'",
-                    const.compile,
-                )
+        self.assert_compile(
+            schema.AddConstraint(
+                schema.ForeignKeyConstraint([a.c.q], [b.c.p], **{kw: phrase})
+            ),
+            f"ALTER TABLE a ADD FOREIGN KEY(q) REFERENCES b (p) "
+            f"{rendered} {phrase}",
+        )
+
+    @testing.combinations(
+        "ondelete", "onupdate", "initially", "match", argnames="kw"
+    )
+    @testing.combinations(
+        "CASCADE; DROP TABLE b",
+        "CASCADE -- comment",
+        "CASCADE /* comment */",
+        "'CASCADE'",
+        '"CASCADE"',
+        " CASCADE",
+        "CASCADE ",
+        "",
+        # PostgreSQL's syntax added in #11595 is not accepted by the base
+        # compiler
+        "SET NULL(postgresql_db.some_column)",
+        argnames="phrase",
+    )
+    def test_fk_illegal_sql_phrases(self, kw, phrase):
+        a = Table("a", MetaData(), Column("q", Integer))
+        b = Table("b", MetaData(), Column("p", Integer))
+
+        const = schema.AddConstraint(
+            schema.ForeignKeyConstraint([a.c.q], [b.c.p], **{kw: phrase})
+        )
+        with expect_raises_message(
+            exc.CompileError,
+            rf"Unexpected SQL phrase: {re.escape(repr(phrase))}",
+        ):
+            const.compile()
 
 
 class SchemaTest(fixtures.TestBase, AssertsCompiledSQL):
@@ -7764,6 +8018,57 @@ class CorrelateTest(fixtures.TestBase, AssertsCompiledSQL):
         self._assert_having_uncorrelated(
             select(t2).having(t2.c.a == s1.correlate(None).scalar_subquery())
         )
+
+    @testing.variation("first", ["auto", "none", "except_none"])
+    def test_correlate_none_cached(self, first):
+        """test #13767"""
+
+        a = table("a", column("id"))
+        b = table("b", column("id"), column("a_id"))
+        c = table("c", column("id"), column("a_id"), column("b_id"))
+
+        inner = select(c.c.id).where(c.c.b_id == b.c.id, c.c.a_id == a.c.id)
+
+        variations = {
+            "auto": (
+                inner,
+                "SELECT a.id FROM a WHERE EXISTS (SELECT b.id FROM b "
+                "WHERE b.a_id = a.id AND (EXISTS (SELECT c.id FROM c, a "
+                "WHERE c.b_id = b.id AND c.a_id = a.id)))",
+            ),
+            "none": (
+                inner.correlate(None),
+                "SELECT a.id FROM a WHERE EXISTS (SELECT b.id FROM b "
+                "WHERE b.a_id = a.id AND (EXISTS (SELECT c.id FROM c, b, a "
+                "WHERE c.b_id = b.id AND c.a_id = a.id)))",
+            ),
+            "except_none": (
+                inner.correlate_except(None),
+                "SELECT a.id FROM a WHERE EXISTS (SELECT b.id FROM b "
+                "WHERE b.a_id = a.id AND (EXISTS (SELECT c.id FROM c "
+                "WHERE c.b_id = b.id AND c.a_id = a.id)))",
+            ),
+        }
+
+        # compile the given variation first, so that each one gets a
+        # chance to be the cached statement the others could collide with
+        order = [first.name] + [k for k in variations if k != first.name]
+
+        dialect = default.DefaultDialect()
+        cache = {}
+        for name in order:
+            correlated, expected = variations[name]
+            stmt = select(a.c.id).where(
+                select(b.c.id)
+                .where(b.c.a_id == a.c.id, correlated.exists())
+                .exists()
+            )
+            compiled = stmt._compile_w_cache(
+                dialect, compiled_cache=cache, column_keys=[]
+            )[0]
+            eq_ignore_whitespace(str(compiled), expected)
+
+        eq_(len(cache), 3)
 
     def test_correlate_all_where(self):
         t1, t2, s1 = self._fixture()

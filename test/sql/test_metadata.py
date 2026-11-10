@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from contextlib import nullcontext
+import enum
 import pickle
 import re
 
@@ -45,6 +46,10 @@ from sqlalchemy import TypeDecorator
 from sqlalchemy import types as sqltypes
 from sqlalchemy import Unicode
 from sqlalchemy import UniqueConstraint
+from sqlalchemy import util
+from sqlalchemy.dialects import mysql
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects import sqlite
 from sqlalchemy.engine import default
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.compiler import deregister
@@ -54,10 +59,16 @@ from sqlalchemy.schema import DefaultClause
 from sqlalchemy.schema import DropIndex
 from sqlalchemy.sql import naming
 from sqlalchemy.sql import operators
+from sqlalchemy.sql.annotation import Annotated
 from sqlalchemy.sql.base import _NONE_NAME
+from sqlalchemy.sql.base import DialectKWArgConst
+from sqlalchemy.sql.base import DialectKWArgs
 from sqlalchemy.sql.elements import literal_column
 from sqlalchemy.sql.schema import _InsertSentinelColumnDefault
+from sqlalchemy.sql.schema import ColumnCollectionConstraint
+from sqlalchemy.sql.schema import Constraint
 from sqlalchemy.sql.schema import RETAIN_SCHEMA
+from sqlalchemy.sql.schema import SchemaItem
 from sqlalchemy.testing import assert_raises
 from sqlalchemy.testing import assert_raises_message
 from sqlalchemy.testing import AssertsCompiledSQL
@@ -944,6 +955,61 @@ class MetaDataTest(fixtures.TestBase, ComparesTables):
         eq_(m1.get_schema_object_by_name(MyEnum, "foo", schema="t"), e3)
         eq_(m1.get_schema_object_by_name(Enum, "baz", schema="t"), e4)
         eq_(m1.get_schema_object_by_name(Enum, "bar", schema="t"), None)
+
+    @testing.combinations(
+        (default.DefaultDialect,),
+        (postgresql.dialect,),
+        (mysql.dialect,),
+        (sqlite.dialect,),
+        argnames="dialect_cls",
+    )
+    @testing.variation("metadata_arg", [True, False])
+    @testing.variation("enum_arg", ["strings", "pep435"])
+    def test_get_schema_objects_ignores_adapted_enum(
+        self, dialect_cls, metadata_arg, enum_arg
+    ):
+        """test #13625"""
+
+        class Color(enum.Enum):
+            red = "red"
+            blue = "blue"
+
+        m1 = MetaData()
+
+        if enum_arg.pep435:
+            args = (Color,)
+        elif enum_arg.strings:
+            args = ("red", "blue")
+        else:
+            enum_arg.fail()
+
+        if metadata_arg:
+            e = Enum(*args, name="color", metadata=m1)
+        else:
+            e = Enum(*args, name="color")
+
+        t = Table("t", m1, Column("color", e))
+
+        # each new dialect instance produces a new impl
+        for _ in range(3):
+            dialect = dialect_cls()
+            is_not_(e.dialect_impl(dialect), e)
+            str(select(t).compile(dialect=dialect))
+
+        eq_(m1.get_schema_objects(Enum), (e,))
+
+    def test_get_schema_objects_to_metadata(self):
+        """test #13625"""
+
+        m1 = MetaData()
+        e = Enum("red", "blue", name="color", metadata=m1)
+        t = Table("t", m1, Column("color", e))
+
+        m2 = MetaData()
+        t2 = t.to_metadata(m2)
+
+        eq_(m1.get_schema_objects(Enum), (e,))
+        eq_(m2.get_schema_objects(Enum), (t2.c.color.type,))
 
     def test_custom_schematype(self):
         class FooType(sqltypes.SchemaType, sqltypes.TypeEngine):
@@ -5313,6 +5379,90 @@ class ColumnDefaultsTest(fixtures.TestBase):
         ):
             self._fixture(insert_default="x", default="y")
 
+    def _compare_arguments(self):
+        """distinct arguments for ColumnDefault, as factories so that
+        each call produces a new, equivalent object"""
+
+        def no_ctx():
+            return 5
+
+        def other_no_ctx():
+            return 5
+
+        def with_ctx(context):
+            return 5
+
+        return [
+            lambda: 5,
+            lambda: 6,
+            lambda: "5",
+            lambda: func.now(),
+            lambda: func.current_timestamp(),
+            lambda: literal_column("5"),
+            lambda: text("now()"),
+            lambda: text("foo()"),
+            lambda: no_ctx,
+            lambda: other_no_ctx,
+            lambda: with_ctx,
+        ]
+
+    def _compare_fixtures(self):
+        return [
+            (
+                lambda arg=arg, for_update=for_update: ColumnDefault(
+                    arg(), for_update=for_update
+                )
+            )
+            for arg in self._compare_arguments()
+            for for_update in (False, True)
+        ] + [lambda: _InsertSentinelColumnDefault()]
+
+    def test_compare(self):
+        fixtures = self._compare_fixtures()
+
+        eq_(
+            [
+                [fixture_a().compare(fixture_b()) for fixture_b in fixtures]
+                for fixture_a in fixtures
+            ],
+            [
+                [idx_a == idx_b for idx_b in range(len(fixtures))]
+                for idx_a in range(len(fixtures))
+            ],
+        )
+
+    def test_compare_argument(self):
+        arguments = self._compare_arguments()
+
+        eq_(
+            [
+                [
+                    ColumnDefault(arg_a()).compare_argument(arg_b())
+                    for arg_b in arguments
+                ]
+                for arg_a in arguments
+            ],
+            [
+                [idx_a == idx_b for idx_b in range(len(arguments))]
+                for idx_a in range(len(arguments))
+            ],
+        )
+
+    def test_compare_argument_sentinel(self):
+        default = _InsertSentinelColumnDefault()
+        eq_(
+            [default.compare_argument(None), default.compare_argument(5)],
+            [True, False],
+        )
+
+    def test_compare_copy(self):
+        defaults = [fixture() for fixture in self._compare_fixtures()]
+
+        eq_(
+            [default._copy().compare(default) for default in defaults],
+            [True] * len(defaults),
+        )
+
 
 class ColumnOptionsTest(fixtures.TestBase):
     def test_default_generators(self):
@@ -5503,13 +5653,38 @@ class DialectKWArgTest(fixtures.TestBase):
 
         class ParticipatingDialect(DefaultDialect):
             construct_arguments = [
-                (schema.Index, {"x": 5, "y": False, "z_one": None}),
+                (
+                    schema.Index,
+                    {
+                        "x": 5,
+                        "y": False,
+                        "z_one": None,
+                        "state": DialectKWArgConst.REFLECTED_ONLY,
+                        "other_state": DialectKWArgConst.REFLECTED_ONLY,
+                    },
+                ),
                 (schema.ForeignKeyConstraint, {"foobar": False}),
+                (schema.Table, {"state": DialectKWArgConst.REFLECTED_ONLY}),
+                (schema.Column, {"state": DialectKWArgConst.REFLECTED_ONLY}),
+                (
+                    schema.Constraint,
+                    {"state": DialectKWArgConst.REFLECTED_ONLY},
+                ),
+                (schema.Sequence, {"state": DialectKWArgConst.REFLECTED_ONLY}),
+                (schema.Identity, {"state": DialectKWArgConst.REFLECTED_ONLY}),
             ]
 
         class ParticipatingDialect2(DefaultDialect):
             construct_arguments = [
-                (schema.Index, {"x": 9, "y": True, "pp": "default"}),
+                (
+                    schema.Index,
+                    {
+                        "x": 9,
+                        "y": True,
+                        "pp": "default",
+                        "state": DialectKWArgConst.REFLECTED_ONLY,
+                    },
+                ),
                 (schema.Table, {"*": None}),
             ]
 
@@ -5968,6 +6143,256 @@ class DialectKWArgTest(fixtures.TestBase):
             eq_(
                 idx.get_dialect_option(dialect, "x", else_="fallback"),
                 "fallback",
+            )
+
+    @testing.combinations(True, False, argnames="value")
+    def test_reflection_only_constructor_option(self, value):
+        with self._fixture():
+            idx = Index("a", "b", participating_state=value, participating_x=7)
+            eq_(idx.dialect_kwargs, {"participating_x": 7})
+            eq_(
+                dict(idx.dialect_options["participating"]),
+                {"x": 7, "y": False, "z_one": None},
+            )
+            eq_(idx.reflect_only_elements, {"participating": {"state": value}})
+
+    def test_reflection_only_absent_dialect(self):
+        """dialects with no reflection-only values present, including ones
+        that aren't installed, give an empty mapping and are not members"""
+
+        with self._fixture():
+            idx = Index("a", "b", participating_state=True)
+            eq_(
+                {
+                    name: (
+                        name in idx.reflect_only_elements,
+                        idx.reflect_only_elements[name],
+                    )
+                    for name in ("participating", "participating2", "nosuch")
+                },
+                {
+                    "participating": (True, {"state": True}),
+                    "participating2": (False, {}),
+                    "nosuch": (False, {}),
+                },
+            )
+
+    def test_get_dialect_option_participating_reflect_only(self):
+        with self._fixture():
+            idx = Index("a", "b", participating_state=True)
+            dialect = mock.Mock()
+            dialect.name = "participating"
+            eq_(
+                idx.get_dialect_option(dialect, "state", else_="absent"),
+                "absent",
+            )
+
+    def test_reflection_only_non_index_construct(self):
+        with self._fixture():
+            t = Table(
+                "t",
+                MetaData(),
+                Column("x", Integer),
+                participating_state=True,
+            )
+            eq_(t.reflect_only_elements, {"participating": {"state": True}})
+            eq_(t.dialect_kwargs, {})
+
+    def test_reflection_only_options(self):
+        with self._fixture():
+            idx = Index(
+                "a",
+                "b",
+                participating_state=True,
+                participating_other_state="second value",
+                participating2_state="other state",
+                participating_x=7,
+            )
+            eq_(idx.dialect_kwargs, {"participating_x": 7})
+            eq_(
+                idx.reflect_only_elements,
+                {
+                    "participating": {
+                        "state": True,
+                        "other_state": "second value",
+                    },
+                    "participating2": {"state": "other state"},
+                },
+            )
+
+    def test_reflection_only_immutable(self):
+        with self._fixture():
+            idx = Index("a", "b", participating_state=True)
+
+            with testing.expect_raises(TypeError):
+                idx.reflect_only_elements["participating"] = {}
+            with testing.expect_raises(TypeError):
+                idx.reflect_only_elements["participating"]["state"] = False
+            with testing.expect_raises(AttributeError):
+                idx.reflect_only_elements = {}
+
+    @testing.combinations(
+        "dialect_kwargs", "dialect_options", argnames="write_path"
+    )
+    def test_reflection_only_assignment(self, write_path):
+        """each write path for a marked argument lands in
+        reflect_only_elements and stays out of the flat kwargs view."""
+
+        with self._fixture():
+            idx = Index("a", "b")
+            if write_path == "dialect_kwargs":
+                idx.dialect_kwargs["participating_state"] = True
+            else:
+                idx.dialect_options["participating"]["state"] = True
+
+            eq_(
+                (idx.reflect_only_elements, idx.dialect_kwargs),
+                ({"participating": {"state": True}}, {}),
+            )
+
+    def test_reflection_only_pickle(self):
+        with self._fixture():
+            t = Table("t", MetaData(), Column("x", Integer))
+            idx = Index(
+                "ix",
+                t.c.x,
+                participating_state=True,
+                participating_x=7,
+            )
+            pickled = pickle.loads(pickle.dumps(idx))
+            eq_(
+                pickled.reflect_only_elements,
+                {"participating": {"state": True}},
+            )
+
+    def test_reflection_only_to_metadata(self):
+        """reflection-only state is carried along for each DialectKWArgs
+        construct copied by Table.to_metadata()."""
+
+        with self._fixture():
+            m = MetaData()
+            Table(
+                "parent",
+                m,
+                Column("id", Integer, primary_key=True),
+                Column("id2", Integer),
+                UniqueConstraint("id", "id2"),
+            )
+            t = Table(
+                "t",
+                m,
+                Column(
+                    "id",
+                    Integer,
+                    Sequence("s", participating_state="sequence"),
+                    primary_key=True,
+                ),
+                Column(
+                    "x",
+                    Integer,
+                    ForeignKey("parent.id", participating_state="fk"),
+                    participating_state="column",
+                ),
+                Column(
+                    "y",
+                    Integer,
+                    Identity(participating_state="identity"),
+                ),
+                Column("p1", Integer),
+                Column("p2", Integer),
+                ForeignKeyConstraint(
+                    ["p1", "p2"],
+                    ["parent.id", "parent.id2"],
+                    participating_state="fkc",
+                ),
+                UniqueConstraint("x", participating_state="unique"),
+                CheckConstraint("x > 5", participating_state="check"),
+                participating_state="table",
+            )
+            t.primary_key.dialect_kwargs["participating_state"] = "pk"
+            Index("ix", t.c.x, participating_state="index")
+
+            copied = t.to_metadata(MetaData())
+
+            constraints = {type(c): c for c in copied.constraints}
+            eq_(
+                [
+                    dict(elem.reflect_only_elements)
+                    for elem in [
+                        copied,
+                        copied.c.x,
+                        # ForeignKey passes its dialect arguments along
+                        # to its ForeignKeyConstraint
+                        next(iter(copied.c.x.foreign_keys)).constraint,
+                        copied.c.id.default,
+                        copied.c.y.server_default,
+                        next(iter(copied.c.p1.foreign_keys)).constraint,
+                        constraints[UniqueConstraint],
+                        constraints[CheckConstraint],
+                        copied.primary_key,
+                        next(iter(copied.indexes)),
+                    ]
+                ],
+                [
+                    {"participating": {"state": state}}
+                    for state in [
+                        "table",
+                        "column",
+                        "fk",
+                        "sequence",
+                        "identity",
+                        "fkc",
+                        "unique",
+                        "check",
+                        "pk",
+                        "index",
+                    ]
+                ],
+            )
+
+    def test_reflection_only_to_metadata_dialect_kwargs(self):
+        """reflection-only state stays out of the dialect_kwargs of the
+        copy."""
+
+        with self._fixture():
+            t = Table("t", MetaData(), Column("x", Integer))
+            Index(
+                "ix",
+                t.c.x,
+                participating_state=True,
+                participating_x=7,
+            )
+            copied_index = next(iter(t.to_metadata(MetaData()).indexes))
+            eq_(
+                (
+                    copied_index.reflect_only_elements,
+                    copied_index.dialect_kwargs,
+                ),
+                ({"participating": {"state": True}}, {"participating_x": 7}),
+            )
+
+    def test_reflection_only_inherited_by_subclass(self):
+        with self._fixture():
+
+            class CustomIndex(Index):
+                pass
+
+            idx = CustomIndex("a", "b", participating_state=True)
+            eq_(idx.reflect_only_elements, {"participating": {"state": True}})
+
+    def test_reflection_only_overridden_by_subclass(self):
+        """a subclass can replace the marker with an ordinary default."""
+
+        with self._fixture():
+
+            class CustomIndex(Index):
+                pass
+
+            CustomIndex.argument_for("participating", "state", False)
+            idx = CustomIndex("a", "b", participating_state=True)
+            eq_(
+                (idx.reflect_only_elements, idx.dialect_kwargs),
+                ({}, {"participating_state": True}),
             )
 
 
@@ -6733,17 +7158,132 @@ class NamingConventionTest(fixtures.TestBase, AssertsCompiledSQL):
 
 
 class CopyDialectOptionsTest(fixtures.TestBase):
-    @contextmanager
-    def _fixture(self):
-        from sqlalchemy.engine.default import DefaultDialect
+    """test that dialect-specific keyword arguments on each
+    :class:`.DialectKWArgs` schema construct are carried along to the copy
+    produced by :meth:`.Table.to_metadata`.
 
-        class CopyDialectOptionsTestDialect(DefaultDialect):
+    Constructs that are local to a dialect, such as PostgreSQL's
+    :class:`.ExcludeConstraint`, are tested within that dialect's suite.
+
+    """
+
+    # (id, construct class, fn(kw) -> Table, fn(Table) -> construct)
+    _cases = [
+        (
+            "table",
+            Table,
+            lambda kw: Table("t", MetaData(), Column("x", Integer), **kw),
+            lambda t: t,
+        ),
+        (
+            "column",
+            Column,
+            lambda kw: Table("t", MetaData(), Column("x", Integer, **kw)),
+            lambda t: t.c.x,
+        ),
+        (
+            "primary_key",
+            PrimaryKeyConstraint,
+            lambda kw: Table(
+                "t",
+                MetaData(),
+                Column("x", Integer),
+                PrimaryKeyConstraint("x", **kw),
+            ),
+            lambda t: t.primary_key,
+        ),
+        (
+            "unique",
+            UniqueConstraint,
+            lambda kw: Table(
+                "t",
+                MetaData(),
+                Column("x", Integer),
+                UniqueConstraint("x", **kw),
+            ),
+            lambda t: next(
+                c for c in t.constraints if isinstance(c, UniqueConstraint)
+            ),
+        ),
+        (
+            "table_check",
+            CheckConstraint,
+            lambda kw: Table(
+                "t",
+                MetaData(),
+                Column("x", Integer),
+                CheckConstraint("x > 5", **kw),
+            ),
+            lambda t: next(
+                c for c in t.constraints if isinstance(c, CheckConstraint)
+            ),
+        ),
+        (
+            "column_check",
+            CheckConstraint,
+            lambda kw: Table(
+                "t",
+                MetaData(),
+                Column("x", Integer, CheckConstraint("x > 5", **kw)),
+            ),
+            lambda t: next(iter(t.c.x.constraints)),
+        ),
+        (
+            "foreign_key_constraint",
+            ForeignKeyConstraint,
+            lambda kw: Table(
+                "t",
+                MetaData(),
+                Column("x", Integer),
+                ForeignKeyConstraint(["x"], ["p.id"], **kw),
+            ),
+            lambda t: next(
+                c for c in t.constraints if isinstance(c, ForeignKeyConstraint)
+            ),
+        ),
+        (
+            "foreign_key",
+            ForeignKey,
+            lambda kw: Table(
+                "t",
+                MetaData(),
+                Column("x", Integer, ForeignKey("p.id", **kw)),
+            ),
+            # ForeignKey passes its dialect arguments along to its
+            # ForeignKeyConstraint
+            lambda t: next(iter(t.c.x.foreign_keys)).constraint,
+        ),
+        (
+            "index",
+            Index,
+            lambda kw: Table(
+                "t", MetaData(), Column("x", Integer), Index("ix", "x", **kw)
+            ),
+            lambda t: next(iter(t.indexes)),
+        ),
+        (
+            "sequence",
+            Sequence,
+            lambda kw: Table(
+                "t", MetaData(), Column("x", Integer, Sequence("s", **kw))
+            ),
+            lambda t: t.c.x.default,
+        ),
+        (
+            "identity",
+            Identity,
+            lambda kw: Table(
+                "t", MetaData(), Column("x", Integer, Identity(**kw))
+            ),
+            lambda t: t.c.x.server_default,
+        ),
+    ]
+
+    @testing.fixture
+    def dialect_fixture(self):
+        class CopyDialectOptionsTestDialect(default.DefaultDialect):
             construct_arguments = [
-                (Table, {"some_table_arg": None}),
-                (Column, {"some_column_arg": None}),
-                (Index, {"some_index_arg": None}),
-                (PrimaryKeyConstraint, {"some_pk_arg": None}),
-                (UniqueConstraint, {"some_uq_arg": None}),
+                (cls, {"some_arg": None}) for _, cls, _, _ in self._cases
             ]
 
         def load(dialect_name):
@@ -6755,63 +7295,42 @@ class CopyDialectOptionsTest(fixtures.TestBase):
         with mock.patch("sqlalchemy.dialects.registry.load", load):
             yield
 
-    @classmethod
-    def check_dialect_options_(cls, t):
+    @testing.combinations(
+        *_cases, argnames="cls, make_table, get_construct", id_="iaaa"
+    )
+    def test_dialect_options_are_copied(
+        self, dialect_fixture, cls, make_table, get_construct
+    ):
+        """test #5276, #13677"""
+
+        kw = {"copydialectoptionstest_some_arg": "x1"}
+
+        t1 = make_table(kw)
+        t2 = t1.to_metadata(MetaData())
+
+        const1, const2 = get_construct(t1), get_construct(t2)
+        is_not_(const1, const2)
         eq_(
-            t.dialect_kwargs["copydialectoptionstest_some_table_arg"],
-            "a1",
-        )
-        eq_(
-            t.c.foo.dialect_kwargs["copydialectoptionstest_some_column_arg"],
-            "a2",
-        )
-        eq_(
-            t.primary_key.dialect_kwargs["copydialectoptionstest_some_pk_arg"],
-            "a3",
-        )
-        eq_(
-            list(t.indexes)[0].dialect_kwargs[
-                "copydialectoptionstest_some_index_arg"
-            ],
-            "a4",
-        )
-        eq_(
-            list(c for c in t.constraints if isinstance(c, UniqueConstraint))[
-                0
-            ].dialect_kwargs["copydialectoptionstest_some_uq_arg"],
-            "a5",
+            (dict(const1.dialect_kwargs), dict(const2.dialect_kwargs)),
+            (kw, kw),
         )
 
-    def test_dialect_options_are_copied(self):
-        with self._fixture():
-            t1 = Table(
-                "t",
-                MetaData(),
-                Column(
-                    "foo",
-                    Integer,
-                    copydialectoptionstest_some_column_arg="a2",
-                ),
-                Column("bar", Integer),
-                PrimaryKeyConstraint(
-                    "foo", copydialectoptionstest_some_pk_arg="a3"
-                ),
-                UniqueConstraint(
-                    "bar", copydialectoptionstest_some_uq_arg="a5"
-                ),
-                copydialectoptionstest_some_table_arg="a1",
-            )
-            Index(
-                "idx",
-                t1.c.foo,
-                copydialectoptionstest_some_index_arg="a4",
-            )
+    def test_all_constructs_covered(self):
+        """ensure every :class:`.DialectKWArgs` schema construct within
+        sqlalchemy.sql has a case in test_dialect_options_are_copied."""
 
-            self.check_dialect_options_(t1)
+        constructs = {
+            cls
+            for cls in util.walk_subclasses(DialectKWArgs)
+            if issubclass(cls, SchemaItem)
+            and not issubclass(cls, Annotated)
+            and cls.__module__.startswith("sqlalchemy.sql.")
+        }
 
-            m2 = MetaData()
-            t2 = t1.to_metadata(m2)  # make a copy
-            self.check_dialect_options_(t2)
+        # base classes, not copied as themselves
+        constructs -= {Constraint, ColumnCollectionConstraint}
+
+        eq_(constructs, {cls for _, cls, _, _ in self._cases})
 
 
 class SentinelColTest(fixtures.TestBase):

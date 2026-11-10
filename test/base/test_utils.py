@@ -2,11 +2,18 @@ import copy
 from decimal import Decimal
 import importlib.metadata
 import inspect
+import json
 import linecache
 import operator
+import os
 from pathlib import Path
 import pickle
+import subprocess
 import sys
+import textwrap
+import types
+from typing import Generic
+from typing import TypeVar
 
 from sqlalchemy import exc
 from sqlalchemy import sql
@@ -3419,6 +3426,72 @@ class AsInterfaceTest(fixtures.TestBase):
 
 
 class TestClassHierarchy(fixtures.TestBase):
+    def test_generic(self):
+        eq_(set(util.class_hierarchy(Generic)), {Generic, object})
+
+    def test_generic_families_are_independent(self):
+        T = TypeVar("T")
+
+        class A(Generic[T]):
+            pass
+
+        class B(Generic[T]):
+            pass
+
+        class Child(A[int]):
+            pass
+
+        eq_(set(util.class_hierarchy(A)), {A, Child, Generic, object})
+        eq_(set(util.class_hierarchy(B)), {B, Generic, object})
+
+    def test_generic_diamond_stays_connected(self):
+        T = TypeVar("T")
+
+        class A(Generic[T]):
+            pass
+
+        class B(Generic[T]):
+            pass
+
+        class Child(A[int], B[int]):
+            pass
+
+        expected = {A, B, Child, Generic, object}
+        eq_(set(util.class_hierarchy(A)), expected)
+        eq_(set(util.class_hierarchy(B)), expected)
+
+    def test_generic_shared_base_stays_connected(self):
+        T = TypeVar("T")
+
+        class Base(Generic[T]):
+            pass
+
+        class A(Base[int]):
+            pass
+
+        class B(Base[str]):
+            pass
+
+        expected = {A, B, Base, Generic, object}
+        eq_(set(util.class_hierarchy(A)), expected)
+        eq_(set(util.class_hierarchy(B)), expected)
+
+    def test_shared_base_alongside_generic_stays_connected(self):
+        T = TypeVar("T")
+
+        class Base:
+            pass
+
+        class A(Base, Generic[T]):
+            pass
+
+        class B(Base, Generic[T]):
+            pass
+
+        expected = {A, B, Base, Generic, object}
+        eq_(set(util.class_hierarchy(A)), expected)
+        eq_(set(util.class_hierarchy(B)), expected)
+
     def test_object(self):
         eq_(set(util.class_hierarchy(object)), {object})
 
@@ -4001,6 +4074,140 @@ class CyExtensionTest(fixtures.TestBase):
             eq_(setup_modules, expected)
 
 
+class FreethreadingNoGILTest(fixtures.TestBase):
+    """On a free-threaded build, ensure importing SQLAlchemy never causes
+    the interpreter to re-enable the GIL.
+
+    CPython re-enables the GIL when an extension module that has not
+    declared ``Py_mod_gil = Py_MOD_GIL_NOT_USED`` is imported, which for
+    Cython is the ``freethreading_compatible`` directive in setup.py.
+    The test suite itself runs with ``PYTHON_GIL=0`` which suppresses
+    this, so the imports are run in a new interpreter with ``PYTHON_GIL``
+    removed from the environment, where the degradation is observable.
+
+    """
+
+    def test_freethreading_detection(self):
+        """the other tests here are skipped on builds where
+        util.freethreading is False; runs on every build to confirm
+        that flag agrees with the interpreter's own description of itself,
+        so that the tests can't silently skip on a free-threaded build.
+
+        util.freethreading is based on the Py_GIL_DISABLED build config
+        var, which indicates a free-threaded build and does not change
+        if the GIL is enabled at runtime.
+
+        """
+        eq_(util.freethreading, "free-threading build" in sys.version)
+
+    def _run_imports(self, modules):
+        code = textwrap.dedent("""
+            import importlib
+            import importlib.machinery
+            import json
+            import sys
+            import warnings
+
+            # report None if the function is not present, which fails
+            # the test rather than skipping it
+            is_gil_enabled = getattr(sys, "_is_gil_enabled", lambda: None)
+
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                initial = is_gil_enabled()
+                loaded = {
+                    name: importlib.import_module(name)
+                    for name in sys.argv[1:]
+                }
+                final = is_gil_enabled()
+
+            print(
+                json.dumps(
+                    {
+                        "initial_gil_enabled": initial,
+                        "final_gil_enabled": final,
+                        "gil_warnings": [
+                            str(m.message)
+                            for m in w
+                            if "global interpreter lock" in str(m.message)
+                        ],
+                        "extension_modules": sorted(
+                            name
+                            for name, mod in loaded.items()
+                            if mod.__file__.endswith(
+                                tuple(importlib.machinery.EXTENSION_SUFFIXES)
+                            )
+                        ),
+                        "sqlalchemy_file": sys.modules["sqlalchemy"].__file__,
+                    }
+                )
+            )
+            """)
+
+        parts = list(sys.path)
+        if os.environ.get("PYTHONPATH"):
+            parts.append(os.environ["PYTHONPATH"])
+
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join(parts)}
+        env.pop("PYTHON_GIL", None)
+
+        proc = subprocess.run(
+            [sys.executable, "-c", code, *modules],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(
+                "subprocess failed: %s" % proc.stderr.decode(errors="replace")
+            )
+        result = json.loads(proc.stdout)
+
+        # make sure the subprocess tested the same SQLAlchemy we're testing
+        eq_(result.pop("sqlalchemy_file"), sys.modules["sqlalchemy"].__file__)
+        return result
+
+    @testing.requires.freethreading
+    @testing.requires.cextensions
+    def test_cython_extensions_dont_enable_gil(self):
+        names = [m.__name__ for m in _all_cython_modules()]
+
+        eq_(
+            self._run_imports(names),
+            {
+                "initial_gil_enabled": False,
+                "final_gil_enabled": False,
+                "gil_warnings": [],
+                "extension_modules": sorted(names),
+            },
+        )
+
+    @testing.requires.freethreading
+    def test_import_sqlalchemy_doesnt_enable_gil(self):
+        eq_(
+            self._run_imports(["sqlalchemy", "sqlalchemy.orm"]),
+            {
+                "initial_gil_enabled": False,
+                "final_gil_enabled": False,
+                "gil_warnings": [],
+                "extension_modules": [],
+            },
+        )
+
+    @testing.requires.freethreading
+    @testing.requires.greenlet
+    def test_import_asyncio_doesnt_enable_gil(self):
+        eq_(
+            self._run_imports(["greenlet", "sqlalchemy.ext.asyncio"]),
+            {
+                "initial_gil_enabled": False,
+                "final_gil_enabled": False,
+                "gil_warnings": [],
+                "extension_modules": [],
+            },
+        )
+
+
 class TestTest(fixtures.TestBase):
     """Test of test things"""
 
@@ -4027,18 +4234,25 @@ class GeneratedSourceTest(fixtures.TestBase):
 
     """
 
+    def _patch_linecache(self, **kw):
+        """replace the linecache module as seen by langhelpers only.
+
+        the real linecache.cache is used by traceback formatting, including
+        pytest's, as well as by finalizers of functions generated by other
+        tests which may be collected at any time, so it's never altered.
+
+        """
+        return mock.patch.object(
+            langhelpers, "linecache", types.SimpleNamespace(**kw)
+        )
+
     @testing.fixture
     def no_linecache_fixture(self):
-        the_cache = linecache.cache
-        try:
-
-            delattr(linecache, "cache")
+        with self._patch_linecache():
             yield
-        finally:
-            linecache.cache = the_cache
 
     def test_linecache_safe_getter_non_dict(self):
-        with mock.patch.object(linecache, "cache", 12):
+        with self._patch_linecache(cache=12):
             with expect_raises_message(
                 AttributeError, "linecache has changed from being a dict"
             ):
@@ -4049,7 +4263,7 @@ class GeneratedSourceTest(fixtures.TestBase):
             langhelpers._linecache_cache_getter()
 
     def test_linecache_changed_to_a_non_dict(self):
-        with mock.patch.object(linecache, "cache", 12):
+        with self._patch_linecache(cache=12):
             fn = langhelpers.exec_code_in_env(
                 "def foo():\n    return 1\n", {}, "foo", "foo for testing"
             )
@@ -4149,10 +4363,31 @@ class GeneratedSourceTest(fixtures.TestBase):
         filename = fn.__code__.co_filename
         entry = linecache.cache[filename]
 
-        with mock.patch.object(
-            linecache, "cache", RaceyCache(linecache.cache)
-        ):
+        with self._patch_linecache(cache=RaceyCache(linecache.cache)):
             langhelpers._remove_linecache_entry(filename, entry)
+
+    @testing.variation("linecache_state", ["non_dict", "disappeared"])
+    def test_removal_tolerates_linecache_change(self, linecache_state):
+        """the finalizer does nothing if linecache.cache has disappeared or
+        is no longer a dict; as it runs from a finalizer, an exception
+        raised there would surface as an unraisable error.
+
+        """
+        fn = langhelpers.exec_code_in_env(
+            "def foo():\n    return 1\n", {}, "foo", "tolerates_change"
+        )
+        filename = fn.__code__.co_filename
+        entry = linecache.cache[filename]
+
+        if linecache_state.non_dict:
+            patch = self._patch_linecache(cache=12)
+        else:
+            patch = self._patch_linecache()
+
+        with patch:
+            langhelpers._remove_linecache_entry(filename, entry)
+
+        eq_(linecache.cache[filename], entry)
 
     def test_regenerated_entry_survives_collection(self):
         """a superseded function's finalizer must not remove the entry that

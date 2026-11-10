@@ -69,6 +69,8 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.orm import remote
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import undefer
+from sqlalchemy.orm import Unmapped
+from sqlalchemy.orm import unmapped_column
 from sqlalchemy.orm import WriteOnlyMapped
 from sqlalchemy.orm.attributes import _CollectionAttributeImpl
 from sqlalchemy.orm.collections import attribute_keyed_dict
@@ -1074,6 +1076,48 @@ class MappedColumnTest(fixtures.TestBase, testing.AssertsCompiledSQL):
                 id: Mapped[int] = mapped_column(primary_key=True)
                 name: str = mapped_column()  # type: ignore
 
+    @testing.requires.python314
+    def test_missing_mapped_lhs_unresolvable_name(self, decl_base):
+        """test #13602.
+
+        under pep-649 (python 3.14, no ``from __future__ import
+        annotations``), an annotation that names an undefined symbol is
+        no longer evaluated by the interpreter up front; it arrives here
+        as a ``ForwardRef``.  previously the only non-evaluated form
+        possible was a plain string, so this case could not be
+        constructed at all.
+
+        """
+
+        with expect_annotation_syntax_error("User.name"):
+
+            class User(decl_base):
+                __tablename__ = "users"
+
+                id: Mapped[int] = mapped_column(primary_key=True)
+                name: Bogus  # type: ignore  # noqa: F821
+
+    @testing.requires.python314
+    def test_missing_mapped_lhs_unresolvable_nested_mapped(self, decl_base):
+        """test #13602.
+
+        ``Mapped[]`` nested inside another construct along with an
+        unresolvable name.  under ``__future__`` annotations, this arrives
+        as a string that fails to evaluate and is reported as an
+        un-interpretable annotation, since it contains ``Mapped[``; under
+        pep-649, the outer ``list`` resolves and the usual "use Mapped[]"
+        error is raised.  either way, a :class:`.MappedAnnotationError`.
+
+        """
+
+        with expect_raises(orm_exc.MappedAnnotationError):
+
+            class User(decl_base):
+                __tablename__ = "users"
+
+                id: Mapped[int] = mapped_column(primary_key=True)
+                name: list[Mapped[Bogus]]  # type: ignore  # noqa: F821
+
     def test_construct_lhs_separate_name(self, decl_base):
         class User(decl_base):
             __tablename__ = "users"
@@ -1942,6 +1986,67 @@ class TypeResolutionTests(fixtures.TestBase, testing.AssertsCompiledSQL):
 
                 id: Mapped[int] = mapped_column(primary_key=True)
                 data: Mapped["fake"]  # noqa
+
+    @testing.requires.python314
+    def test_dont_ignore_unresolvable_unquoted(self, decl_base):
+        """test #8888, #13602.
+
+        as in ``test_dont_ignore_unresolvable``, but the inner name is
+        left unquoted.  under pep-649 this is only reachable because the
+        interpreter no longer evaluates the annotation up front.
+
+        """
+
+        with expect_raises_message(
+            sa_exc.ArgumentError,
+            r"Could not resolve all types within mapped annotation: "
+            r"\".*Mapped\[.*fake.*\]\".  Ensure all types are written "
+            r"correctly and are imported within the module in use.",
+        ):
+
+            class A(decl_base):
+                __tablename__ = "a"
+
+                id: Mapped[int] = mapped_column(primary_key=True)
+                data: Mapped[fake]  # noqa: F821
+
+    @testing.requires.python314
+    def test_indirect_mapped_name_closure_level(self, decl_base):
+        """test #8759, #13602.
+
+        a name bound in the enclosing scope rather than at the module
+        level can't be resolved under ``__future__`` annotations, since
+        the string is evaluated against module globals; under pep-649 the
+        annotation closes over the enclosing scope, so it resolves and the
+        attribute maps normally.
+
+        """
+
+        M2 = Mapped
+
+        expect_fail = False
+        # anno only: expect_fail = True
+
+        def make_class():
+            class Foo(decl_base):
+                __tablename__ = "foo"
+
+                id: M2[int] = mapped_column(primary_key=True)
+
+                data2: M2[int]
+
+            return Foo
+
+        if expect_fail:
+            with expect_raises_message(
+                sa_exc.ArgumentError,
+                r"Could not interpret annotation M2\[int\].  Check that it "
+                "uses names that are correctly imported at the module level.",
+            ):
+                make_class()
+        else:
+            Foo = make_class()
+            is_(Foo.__table__.c.data2.type._type_affinity, Integer)
 
     def test_type_dont_mis_resolve_on_superclass(self):
         """test for #8859.
@@ -4556,6 +4661,553 @@ class AllYourFavoriteHitsTest(fixtures.TestBase, testing.AssertsCompiledSQL):
 
             a_id: Mapped[int] = mapped_column(ForeignKey("a.id"))
             a: Mapped[A] = relationship(back_populates="bs")
+
+
+class UnmappedColumnTest(fixtures.TestBase, testing.AssertsCompiledSQL):
+    """test the Unmapped[] annotation and unmapped_column(), #13650"""
+
+    __dialect__ = "default"
+
+    @testing.variation("style", ["plain", "dataclass"])
+    def test_table_and_mapping(self, decl_base, dc_decl_base, style):
+        if style.dataclass:
+            base, id_kw = dc_decl_base, {"init": False}
+        else:
+            base, id_kw = decl_base, {}
+
+        class A(base):
+            __tablename__ = "a"
+
+            id: Mapped[int] = mapped_column(primary_key=True, **id_kw)
+            data: Mapped[str]
+
+            x: Unmapped[Optional[str]] = unmapped_column()
+            y: Unmapped[int] = unmapped_column(server_default="5")
+            z: Unmapped[Optional[str]] = unmapped_column("zname", String(30))
+
+        self.assert_compile(
+            CreateTable(A.__table__),
+            "CREATE TABLE a (id INTEGER NOT NULL, data VARCHAR NOT NULL, "
+            "x VARCHAR, y INTEGER DEFAULT '5' NOT NULL, zname VARCHAR(30), "
+            "PRIMARY KEY (id))",
+        )
+        eq_(list(A.__table__.c.keys()), ["id", "data", "x", "y", "zname"])
+        eq_(inspect(A).attrs.keys(), ["id", "data"])
+        eq_(
+            [k for k in ("x", "y", "z") if hasattr(A, k)],
+            [],
+        )
+
+        a1 = A(data="d")
+        eq_(a1.__dict__.keys() & {"x", "y", "z"}, set())
+
+        if style.dataclass:
+            eq_(
+                list(_py_inspect.signature(A.__init__).parameters),
+                ["self", "data"],
+            )
+            eq_([f.name for f in dataclasses.fields(A)], ["id", "data"])
+
+    @testing.variation("style", ["plain", "dataclass"])
+    def test_bare_annotation(self, decl_base, dc_decl_base, style):
+        if style.dataclass:
+            base, id_kw = dc_decl_base, {"init": False}
+        else:
+            base, id_kw = decl_base, {}
+
+        class A(base):
+            __tablename__ = "a"
+
+            id: Mapped[int] = mapped_column(primary_key=True, **id_kw)
+            x: Unmapped[Optional[str]]
+            data: Mapped[str]
+
+        self.assert_compile(
+            CreateTable(A.__table__),
+            "CREATE TABLE a (id INTEGER NOT NULL, x VARCHAR, "
+            "data VARCHAR NOT NULL, PRIMARY KEY (id))",
+        )
+        eq_(inspect(A).attrs.keys(), ["id", "data"])
+        is_false(hasattr(A, "x"))
+
+        if style.dataclass:
+            eq_(
+                list(_py_inspect.signature(A.__init__).parameters),
+                ["self", "data"],
+            )
+
+    def test_type_from_annotated(self, decl_base):
+        global str30
+
+        str30 = Annotated[str, mapped_column(String(30), comment="c")]
+
+        class A(decl_base):
+            __tablename__ = "a"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            x: Unmapped[str30]
+            y: Unmapped[Optional[str30]] = unmapped_column(index=True)
+
+        eq_(A.__table__.c.x.type.length, 30)
+        eq_(A.__table__.c.x.comment, "c")
+        is_false(A.__table__.c.x.nullable)
+        eq_(A.__table__.c.y.type.length, 30)
+        is_true(A.__table__.c.y.nullable)
+        is_true(A.__table__.c.y.index)
+        eq_(inspect(A).attrs.keys(), ["id"])
+
+    def test_sort_order(self, decl_base):
+        class A(decl_base):
+            __tablename__ = "a"
+
+            x: Unmapped[int] = unmapped_column(sort_order=10)
+            id: Mapped[int] = mapped_column(primary_key=True)
+            data: Mapped[str]
+
+        eq_(list(A.__table__.c.keys()), ["id", "data", "x"])
+
+    def test_foreign_key(self, decl_base):
+        class A(decl_base):
+            __tablename__ = "a"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+
+        class B(decl_base):
+            __tablename__ = "b"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            a_id: Unmapped[Optional[int]] = unmapped_column(ForeignKey("a.id"))
+
+        eq_(
+            [fk.column for fk in B.__table__.c.a_id.foreign_keys],
+            [A.__table__.c.id],
+        )
+        eq_(inspect(B).attrs.keys(), ["id"])
+
+    @testing.variation("style", ["plain", "dataclass"])
+    def test_mixin(self, decl_base, dc_decl_base, style):
+        if style.dataclass:
+            base, id_kw = dc_decl_base, {"init": False}
+
+            class Mixin(MappedAsDataclass):
+                x: Unmapped[Optional[str]] = unmapped_column()
+                y: Unmapped[Optional[int]]
+
+        else:
+            base, id_kw = decl_base, {}
+
+            class Mixin:
+                x: Unmapped[Optional[str]] = unmapped_column()
+                y: Unmapped[Optional[int]]
+
+        class A(Mixin, base):
+            __tablename__ = "a"
+
+            id: Mapped[int] = mapped_column(primary_key=True, **id_kw)
+
+        class B(Mixin, base):
+            __tablename__ = "b"
+
+            id: Mapped[int] = mapped_column(primary_key=True, **id_kw)
+
+        eq_(list(A.__table__.c.keys()), ["id", "x", "y"])
+        eq_(list(B.__table__.c.keys()), ["id", "x", "y"])
+        is_not(A.__table__.c.x, B.__table__.c.x)
+        eq_(inspect(A).attrs.keys(), ["id"])
+        eq_(inspect(B).attrs.keys(), ["id"])
+
+        if style.dataclass:
+            eq_(list(_py_inspect.signature(A.__init__).parameters), ["self"])
+
+    def test_single_inh(self, decl_base):
+        class A(decl_base):
+            __tablename__ = "a"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            type: Mapped[str]
+
+            __mapper_args__ = {
+                "polymorphic_on": "type",
+                "polymorphic_identity": "a",
+            }
+
+        class B(A):
+            x: Unmapped[Optional[str]] = unmapped_column()
+            bdata: Mapped[Optional[str]]
+
+            __mapper_args__ = {"polymorphic_identity": "b"}
+
+        eq_(list(A.__table__.c.keys()), ["id", "type", "x", "bdata"])
+        eq_(inspect(A).attrs.keys(), ["id", "type"])
+        eq_(inspect(B).attrs.keys(), ["id", "type", "bdata"])
+
+    def test_joined_inh(self, decl_base):
+        class A(decl_base):
+            __tablename__ = "a"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            type: Mapped[str]
+            x: Unmapped[Optional[str]] = unmapped_column()
+
+            __mapper_args__ = {
+                "polymorphic_on": "type",
+                "polymorphic_identity": "a",
+            }
+
+        class B(A):
+            __tablename__ = "b"
+
+            id: Mapped[int] = mapped_column(
+                ForeignKey("a.id"), primary_key=True
+            )
+            y: Unmapped[Optional[str]] = unmapped_column()
+
+            __mapper_args__ = {"polymorphic_identity": "b"}
+
+        eq_(list(A.__table__.c.keys()), ["id", "type", "x"])
+        eq_(list(B.__table__.c.keys()), ["id", "y"])
+        eq_(inspect(A).attrs.keys(), ["id", "type"])
+        eq_(inspect(B).attrs.keys(), ["id", "type"])
+
+    def test_add_to_existing_class(self, decl_base):
+        class A(decl_base):
+            __tablename__ = "a"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+
+        A.x = unmapped_column(String(30))
+
+        eq_(list(A.__table__.c.keys()), ["id", "x"])
+        eq_(inspect(A).attrs.keys(), ["id"])
+        is_false(hasattr(A, "x"))
+
+    def test_merges_w_exclude_properties(self, decl_base):
+        class A(decl_base):
+            __tablename__ = "a"
+            __table_args__ = (Column("q", Integer),)
+            __mapper_args__ = {"exclude_properties": ["q"]}
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            x: Unmapped[Optional[str]] = unmapped_column()
+
+        eq_(list(A.__table__.c.keys()), ["id", "x", "q"])
+        eq_(inspect(A).attrs.keys(), ["id"])
+
+    @testing.variation("style", ["plain", "dataclass"])
+    def test_core_default_on_insert(
+        self, decl_base, dc_decl_base, style, connection
+    ):
+        base = dc_decl_base if style.dataclass else decl_base
+
+        class A(base):
+            __tablename__ = "a"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            x: Unmapped[Optional[str]] = unmapped_column(default="xd")
+            y: Unmapped[Optional[str]] = unmapped_column(insert_default="yd")
+            z: Unmapped[Optional[str]] = unmapped_column(default=None)
+
+        base.metadata.create_all(connection)
+        with Session(connection) as sess:
+            sess.add(A(id=1))
+            sess.flush()
+
+        eq_(
+            connection.execute(select(A.__table__)).all(),
+            [(1, "xd", "yd", None)],
+        )
+
+    def test_mapped_w_unmapped_column(self, decl_base):
+        with expect_raises_message(
+            sa_exc.ArgumentError,
+            r'Attribute "A.x" uses unmapped_column\(\) with the Mapped\[\] '
+            "annotation",
+        ):
+
+            class A(decl_base):
+                __tablename__ = "a"
+
+                id: Mapped[int] = mapped_column(primary_key=True)
+                x: Mapped[int] = unmapped_column()
+
+    @testing.variation("rhs", ["mapped_column", "column", "plain"])
+    def test_unmapped_w_other_rhs(self, decl_base, rhs):
+        with expect_raises_message(
+            sa_exc.ArgumentError,
+            r'Attribute "A.x" uses the Unmapped\[\] annotation, which must '
+            r"be used with unmapped_column\(\)",
+        ):
+
+            class A(decl_base):
+                __tablename__ = "a"
+
+                id: Mapped[int] = mapped_column(primary_key=True)
+
+                if rhs.mapped_column:
+                    x: Unmapped[int] = mapped_column()
+                elif rhs.column:
+                    x: Unmapped[int] = Column(Integer)
+                elif rhs.plain:
+                    x: Unmapped[int] = 5
+                else:
+                    rhs.fail()
+
+    def test_dialect_kwargs(self, decl_base):
+        class A(decl_base):
+            __tablename__ = "a"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            x: Unmapped[str] = unmapped_column(
+                sqlite_on_conflict_not_null="FAIL"
+            )
+
+        eq_(
+            A.__table__.c.x.dialect_options["sqlite"]["on_conflict_not_null"],
+            "FAIL",
+        )
+        self.assert_compile(
+            CreateTable(A.__table__),
+            "CREATE TABLE a (id INTEGER NOT NULL, "
+            "x VARCHAR NOT NULL ON CONFLICT FAIL, PRIMARY KEY (id))",
+            dialect="sqlite",
+        )
+        eq_(inspect(A).attrs.keys(), ["id"])
+
+    @testing.combinations(
+        ({"deferred": True}, "'deferred'"),
+        ({"deferred_group": "g"}, "'deferred_group'"),
+        ({"deferred_raiseload": True}, "'deferred_raiseload'"),
+        ({"active_history": True}, "'active_history'"),
+        (
+            {"deferred": True, "active_history": True},
+            "'deferred', 'active_history'",
+        ),
+        argnames="kw, names",
+    )
+    @testing.variation("style", ["direct", "annotated"])
+    def test_orm_only_args_not_accepted(self, decl_base, kw, names, style):
+        """test that ORM-only arguments are rejected, whether passed to
+        unmapped_column() directly or via a mapped_column() inside of
+        Annotated."""
+
+        global unmapped_annotated_str
+
+        unmapped_annotated_str = Annotated[str, mapped_column(**kw)]
+
+        with expect_raises_message(
+            sa_exc.ArgumentError,
+            r'Attribute "A.x" is not mapped, and does not accept the '
+            rf"argument\(s\) {names}",
+        ):
+
+            class A(decl_base):
+                __tablename__ = "a"
+
+                id: Mapped[int] = mapped_column(primary_key=True)
+
+                if style.direct:
+                    x: Unmapped[str] = unmapped_column(**kw)
+                elif style.annotated:
+                    x: Unmapped[unmapped_annotated_str]
+                else:
+                    style.fail()
+
+    @testing.requires.autoincrement_without_sequence
+    @testing.variation("style", ["direct", "annotated"])
+    def test_unmapped_primary_key(self, decl_base, style, connection):
+        """an unmapped surrogate primary key, with the mapper using a
+        different column for identity"""
+
+        global unmapped_pk_int
+
+        unmapped_pk_int = Annotated[
+            int, mapped_column(primary_key=True, autoincrement=True)
+        ]
+
+        class A(decl_base):
+            __tablename__ = "a"
+            __mapper_args__ = {"primary_key": ["code"]}
+
+            if style.direct:
+                surrogate_id: Unmapped[int] = unmapped_column(
+                    primary_key=True, autoincrement=True
+                )
+            elif style.annotated:
+                surrogate_id: Unmapped[unmapped_pk_int]
+            else:
+                style.fail()
+
+            code: Mapped[str] = mapped_column(String(10), unique=True)
+            data: Mapped[str]
+
+        eq_(list(A.__table__.primary_key.columns.keys()), ["surrogate_id"])
+        is_true(A.__table__.c.surrogate_id.autoincrement)
+        eq_(inspect(A).attrs.keys(), ["code", "data"])
+        eq_([c.key for c in inspect(A).primary_key], ["code"])
+
+        decl_base.metadata.create_all(connection)
+        with Session(connection) as sess:
+            sess.add_all([A(code="x", data="d1"), A(code="y", data="d2")])
+            sess.flush()
+            sess.expunge_all()
+
+            eq_(sess.get(A, "y").data, "d2")
+            sess.get(A, "x").data = "d3"
+            sess.flush()
+
+        eq_(
+            connection.execute(
+                select(A.__table__.c.code, A.__table__.c.data).order_by(
+                    A.__table__.c.surrogate_id
+                )
+            ).all(),
+            [("x", "d3"), ("y", "d2")],
+        )
+        eq_(
+            connection.scalar(
+                select(func.count(A.__table__.c.surrogate_id.distinct()))
+            ),
+            2,
+        )
+
+    def test_unmapped_primary_key_requires_mapper_pk(self, decl_base):
+        """without a mapper primary_key argument, the mapper can't use the
+        unmapped primary key column for identity"""
+
+        with expect_raises_message(
+            sa_exc.ArgumentError,
+            "could not assemble any primary key columns",
+        ):
+
+            class A(decl_base):
+                __tablename__ = "a"
+
+                id: Unmapped[int] = unmapped_column(primary_key=True)
+                data: Mapped[str]
+
+    def test_allowed_args_from_annotated(self, decl_base):
+        """test that Column-level arguments are accepted when they arrive
+        via a mapped_column() inside of Annotated."""
+
+        global unmapped_annotated_str
+
+        unmapped_annotated_str = Annotated[
+            str,
+            mapped_column(
+                String(30),
+                index=True,
+                server_default="q",
+                comment="c",
+                sort_order=10,
+            ),
+        ]
+
+        class A(decl_base):
+            __tablename__ = "a"
+
+            x: Unmapped[unmapped_annotated_str]
+            id: Mapped[int] = mapped_column(primary_key=True)
+            data: Mapped[str]
+
+        x = A.__table__.c.x
+        eq_(
+            (x.type.length, x.index, x.server_default.arg, x.comment),
+            (30, True, "q", "c"),
+        )
+        eq_(list(A.__table__.c.keys()), ["id", "data", "x"])
+        eq_(inspect(A).attrs.keys(), ["id", "data"])
+
+
+class DeprecatedExcludeDeclaredTest(fixtures.TestBase):
+    """test deprecation of exclude_properties / include_properties for
+    attributes declared on the class, #13650"""
+
+    @testing.variation(
+        "style",
+        [
+            "exclude_name",
+            "exclude_column",
+            "include_name",
+            "exclude_deferred",
+            "exclude_dc_default",
+        ],
+    )
+    def test_warns(self, decl_base, dc_decl_base, style):
+        if style.exclude_name:
+            mapper_args = {"exclude_properties": ["x"]}
+        elif style.include_name:
+            mapper_args = {"include_properties": ["id"]}
+        elif style.exclude_column:
+            mapper_args = None
+        elif style.exclude_deferred:
+            mapper_args = {"exclude_properties": ["x"]}
+        elif style.exclude_dc_default:
+            mapper_args = {"exclude_properties": ["x"]}
+        else:
+            style.fail()
+
+        with expect_deprecated(
+            r"Attribute 'x' declared on class .*A.* is excluded from "
+            "the mapping"
+        ):
+            if style.exclude_dc_default:
+
+                class A(dc_decl_base):
+                    __tablename__ = "a"
+                    __mapper_args__ = mapper_args
+
+                    id: Mapped[int] = mapped_column(primary_key=True)
+                    x: Mapped[Optional[str]] = mapped_column(default=None)
+
+            elif style.exclude_column:
+
+                class A(decl_base):
+                    __tablename__ = "a"
+
+                    id: Mapped[int] = mapped_column(primary_key=True)
+                    x: Mapped[Optional[str]]
+
+                    @declared_attr.directive
+                    def __mapper_args__(cls):
+                        return {"exclude_properties": [cls.__table__.c.x]}
+
+            else:
+
+                class A(decl_base):
+                    __tablename__ = "a"
+                    __mapper_args__ = mapper_args
+
+                    id: Mapped[int] = mapped_column(primary_key=True)
+                    x: Mapped[Optional[str]] = mapped_column(
+                        deferred=bool(style.exclude_deferred)
+                    )
+
+    @testing.variation("style", ["table_args", "table"])
+    def test_no_warning_for_table_only_cols(self, decl_base, style):
+        if style.table_args:
+
+            class A(decl_base):
+                __tablename__ = "a"
+                __table_args__ = (Column("x", Integer),)
+                __mapper_args__ = {"exclude_properties": ["x"]}
+
+                id: Mapped[int] = mapped_column(primary_key=True)
+
+        elif style.table:
+
+            class A(decl_base):
+                __table__ = Table(
+                    "a",
+                    decl_base.metadata,
+                    Column("id", Integer, primary_key=True),
+                    Column("x", Integer),
+                )
+                __mapper_args__ = {"include_properties": ["id"]}
+
+        else:
+            style.fail()
+
+        eq_(inspect(A).attrs.keys(), ["id"])
 
 
 class WriteOnlyRelationshipTest(fixtures.TestBase):

@@ -1,10 +1,12 @@
 import logging.handlers
+import random
 import re
 
 import sqlalchemy as tsa
 from sqlalchemy import bindparam
 from sqlalchemy import Column
 from sqlalchemy import Integer
+from sqlalchemy import literal
 from sqlalchemy import MetaData
 from sqlalchemy import or_
 from sqlalchemy import select
@@ -91,6 +93,58 @@ class LogParamsTest(fixtures.TestBase):
         eq_(
             self.buf.buffer[2].message,
             "[raw sql] [SQL parameters hidden due to hide_parameters=True]",
+        )
+
+    @testing.variation("hide_parameters", [True, False])
+    def test_log_column_default_parameters(self, hide_parameters):
+        """test #13724"""
+
+        t = Table(
+            "t",
+            MetaData(),
+            Column("id", Integer, primary_key=True),
+            Column("data", String(50), default=literal("some value")),
+        )
+
+        eng = self.no_param_engine if hide_parameters else self.eng
+
+        with eng.connect() as conn:
+            eq_(conn.scalar(t.c.data.default), "some value")
+
+        if hide_parameters:
+            expected = (
+                "[raw sql] [SQL parameters hidden due to hide_parameters=True]"
+            )
+        else:
+            expected = "[raw sql] ('some value',)"
+
+        eq_(
+            [rec.message for rec in self.buf.buffer],
+            ["SELECT ? AS anon_1", expected],
+        )
+
+    def test_log_column_default_large_parameter(self):
+        """test #13724"""
+
+        largeparam = "".join(chr(random.randint(52, 85)) for i in range(5000))
+
+        t = Table(
+            "t",
+            MetaData(),
+            Column("id", Integer, primary_key=True),
+            Column("data", String, default=literal(largeparam)),
+        )
+
+        with self.eng.connect() as conn:
+            eq_(conn.scalar(t.c.data.default), largeparam)
+
+        eq_(
+            [rec.message for rec in self.buf.buffer],
+            [
+                "SELECT ? AS anon_1",
+                "[raw sql] ('%s ... (4702 characters truncated) ... %s',)"
+                % (largeparam[0:149], largeparam[-149:]),
+            ],
         )
 
     def test_log_large_list_of_tuple(self):
@@ -1021,6 +1075,43 @@ class LoggingTokenTest(fixtures.TestBase):
         self._assert_no_tokens_in_execute(c1)
 
         c1.close()
+
+    @testing.variation("token", ["none", "empty"])
+    def test_logging_token_falsy_fresh_connection(self, token_engine, token):
+        """test #13641"""
+
+        value = None if token.none else ""
+
+        with token_engine.connect() as c1:
+            c1.execution_options(logging_token=value)
+            self._assert_no_tokens_in_execute(c1)
+
+    @testing.variation("token", ["none", "empty"])
+    def test_logging_token_falsy_engine(self, token_engine, token):
+        """test #13641"""
+
+        value = None if token.none else ""
+
+        eng = token_engine.execution_options(logging_token=value)
+
+        with eng.connect() as c1:
+            self._assert_no_tokens_in_execute(c1)
+
+    def test_logging_token_reset_twice(self, token_engine):
+        """test #13641"""
+
+        with token_engine.connect() as c1:
+            c1.execution_options(logging_token="my_name_1")
+            self._assert_token_in_execute(c1, "my_name_1")
+
+            c1.execution_options(logging_token=None)
+            self._assert_no_tokens_in_execute(c1)
+
+            c1.execution_options(logging_token=None)
+            self._assert_no_tokens_in_execute(c1)
+
+            c1.execution_options(logging_token="my_name_2")
+            self._assert_token_in_execute(c1, "my_name_2")
 
     def test_logging_token_option_not_transactional(self, token_engine):
         """test #11210"""

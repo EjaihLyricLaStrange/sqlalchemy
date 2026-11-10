@@ -9,11 +9,489 @@
 
 
 .. changelog::
-    :version: 2.1.0
+    :version: 2.1.9
     :include_notes_from: unreleased_21
 
 .. changelog::
+    :version: 2.1.8
+    :released: November 3, 2026
+
+.. changelog::
+    :version: 2.1.7
+    :released: November 3, 2026
+
+    .. change::
+        :tags: bug, typing
+        :tickets: 13654
+
+        Fixed typing issue where constructs that infer their Python type from a
+        SQL type argument could not be assigned to a wider declared type, such as
+        ``x: Column[int | None] = Column(Integer)`` or ``x: ColumnElement[int |
+        None] = cast(expr, Integer)``, which raised an incompatible argument error
+        under mypy and an incompatible assignment error under pyright.  The
+        construct still infers its type from the given SQL type, where
+        ``Column(Integer)`` is typed as ``Column[int]``; this type may now be
+        widened by the declared type, which is also where nullability is
+        indicated.  This applies to :class:`_schema.Column`, :func:`.cast`,
+        :func:`_sql.try_cast`, :func:`.type_coerce`, :func:`.bindparam`,
+        :func:`_sql.literal`, :func:`_sql.column`, :func:`_sql.literal_column`,
+        :func:`_sql.label`, :meth:`_expression.ColumnElement.cast`,
+        :class:`.Function`, :class:`_types.ARRAY` and
+        :class:`_postgresql.ARRAY`, including when these are passed to ORM
+        constructs such as :func:`_orm.column_property`, :func:`_orm.deferred`
+        and :func:`_orm.query_expression` that are assigned to a wider
+        ``Mapped[]`` annotation.
+
+        This includes assignment of a :class:`_schema.Column` to a wider
+        :class:`_schema.Named` annotation within a :class:`_schema.TypedColumns`
+        class, e.g. ``x: Named[int | None] = Column(SmallInteger)``, for which
+        :class:`_schema.Named` is now covariant.
+
+    .. change::
+        :tags: feature, orm
+        :tickets: 13685
+
+        Added :attr:`_orm.SessionTransaction.connections` and
+        :meth:`_orm.SessionTransaction.bound_connection`, which return the
+        connections a :class:`_orm.SessionTransaction` has already acquired,
+        without acquiring a new one.  This allows, for example, checking whether
+        any connection in the transaction has been invalidated before emitting
+        further SQL.  A SAVEPOINT transaction returned by
+        :meth:`_orm.Session.begin_nested` reports only the connections used
+        within that SAVEPOINT; the root transaction returned by
+        :meth:`_orm.Session.get_transaction` reports all connections.  The same
+        accessors are available on :class:`_asyncio.AsyncSessionTransaction`,
+        returning :class:`_asyncio.AsyncConnection` objects.  Pull request
+        courtesy Artur Shiriev.
+
+        .. seealso::
+
+            :attr:`_orm.SessionTransaction.connections`
+
+            :meth:`_orm.SessionTransaction.bound_connection`
+
+    .. change::
+        :tags: bug, orm, regression
+        :tickets: 13714
+
+        Fixed regression caused by :ticket:`13070` where using two or more
+        :func:`.orm.with_loader_criteria` options for different entities, where
+        the criteria of each referred to the other entity, such as by using
+        :meth:`.RelationshipProperty.Comparator.any` and
+        :meth:`.RelationshipProperty.Comparator.has`, would fail with a
+        ``RecursionError`` when compiling.  A loader criteria option is now
+        no longer applied to a SELECT that's nested at any level within its own
+        criteria; previously this was only checked for the immediate SELECT
+        within the criteria.  This also repairs the same ``RecursionError`` for
+        criteria which refer to each other using explicit subqueries, an issue
+        also present in the 2.0 series.  No backport is planned at the moment as
+        this is an unusual use case.
+
+    .. change::
+        :tags: bug, orm
+        :tickets: 13715
+
+        Fixed issue where :meth:`_orm.Session.merge_all` did not disable autoflush
+        while merging, as :meth:`_orm.Session.merge` does, so that a lazy load
+        emitted during the merge cascade could autoflush a partially merged
+        object, leading to integrity errors or other failures.
+
+    .. change::
+        :tags: bug, orm, regression
+        :tickets: 13718
+
+        Fixed regression caused by :ticket:`12168` where a collection-based
+        :func:`_orm.relationship` using the
+        :ref:`orm_declarative_native_dataclasses` feature with a custom
+        :paramref:`_orm.relationship.collection_class` such as
+        :func:`_orm.attribute_keyed_dict` would raise an error if
+        :paramref:`_orm.relationship.default_factory` were set to the plain
+        ``dict``, ``list`` or ``set`` type that the collection class is based on,
+        such as ``default_factory=dict`` for :func:`_orm.attribute_keyed_dict`.
+        The plain collection type is now accepted as the
+        :paramref:`_orm.relationship.default_factory` in addition to the exact
+        collection class.
+
+    .. change::
+        :tags: bug, sql, regression
+        :tickets: 13719
+
+        Fixed regression caused by :ticket:`12736` where the
+        :meth:`_sql.ColumnOperators.is_` and :meth:`_sql.ColumnOperators.is_not`
+        operators were assigned to the :attr:`.OperatorClass.COMPARISON` operator
+        class, which is not present on all datatypes.  As these operators are valid
+        for every SQL datatype, they are now part of :attr:`.OperatorClass.BASE`,
+        so that expressions such as ``hstore_column.is_not(None)`` no longer emit a
+        deprecation warning.
+
+    .. change::
+        :tags: bug, orm, regression
+        :tickets: 13726
+
+        Fixed regression caused by :ticket:`5987` where the :func:`.selectinload`
+        loader strategy, when loading a many-to-many relationship against an
+        aliased target, such as when using :meth:`.PropComparator.of_type` with a
+        single-inheritance subclass or an :func:`.aliased` construct, would render
+        the join between the association table and the aliased target using the
+        unaliased table name, producing invalid SQL.
+
+    .. change::
+        :tags: bug, engine, regression
+        :tickets: 13738
+
+        Fixed regression where a checked-out pool connection that was garbage
+        collected as part of a reference cycle would not be returned to the pool
+        on Python 3.15, permanently consuming a slot in the pool.  This occurred
+        because Python 3.15 changed the garbage collector to clear weak references
+        that have no callback only after weak reference callbacks have run, which
+        interfered with the pool's ``weakref.finalize()`` based cleanup introduced
+        in 2.1.0rc2.  An ORM :class:`_orm.Session` or :class:`_engine.Connection`
+        that was dropped without being closed while in a transaction was affected.
+
+    .. change::
+        :tags: bug, orm, regression
+        :tickets: 13744, 13745
+
+        Fixed issue where a SAVEPOINT started by :meth:`_orm.Session.begin_nested`
+        would apply execution options to the connection a second time, causing
+        options such as ``isolation_level`` to raise.  Additionally, execution
+        options passed to :meth:`_orm.Session.connection` within a SAVEPOINT are
+        now ignored with a warning if the connection is already present, as
+        documented, where previously they were applied.
+
+    .. change::
+        :tags: bug, orm, regression
+        :tickets: 13748
+
+        Fixed regression caused by :ticket:`12168` where a
+        :func:`_orm.mapped_column` using
+        :paramref:`_orm.mapped_column.use_existing_column` along with
+        :paramref:`_orm.mapped_column.default` in an
+        :ref:`orm_declarative_native_dataclasses` mapping would not persist the
+        given default value.  As the existing :class:`_schema.Column` from the
+        superclass table is mapped in this case, the default value would not take
+        effect for INSERT, and the default from the superclass column, if any,
+        would be used instead.  The unit of work now delivers the dataclass
+        default of an attribute that was never set to the INSERT statement in
+        those cases where the mapped :class:`_schema.Column` does not supply that
+        same default, while the attribute continues to remain un-set until the
+        object is flushed, so that the behaviors established by :ticket:`12168`
+        are maintained.
+
+        This includes a behavioral change for an attribute that is set to ``None``
+        explicitly, which the ORM treats as the default case for a column that has
+        a default, as described at :ref:`session_forcing_null`.  Such an attribute
+        now receives the dataclass default of the subclass, consistent with an
+        attribute that was never set, where previously the default of the
+        superclass column would take effect.
+
+.. changelog::
+    :version: 2.1.6
+    :released: October 21, 2026
+
+    .. change::
+        :tags: usecase, engine
+        :tickets: 13697
+
+        Added :paramref:`.make_url.keep_blank_values` and
+        :paramref:`.URL.update_query_string.keep_blank_values` parameters, which
+        when set to True retain query string parameters with blank values such as
+        ``key=`` in the :attr:`.URL.query` dictionary as empty strings. This allows
+        a :class:`.URL` with empty-string query values to round trip through
+        :meth:`.URL.render_as_string` and :func:`.make_url`. The default behavior
+        of omitting blank values is unchanged, as dialects may not accept an empty
+        string for query parameters that are coerced to other types.
+
+    .. change::
+        :tags: bug, orm, regression
+        :tickets: 13701
+
+        Fixed regression caused by :ticket:`13070` where using more than one
+        :func:`.orm.with_loader_criteria` option for the same entity, where the
+        criteria made use of correlated subqueries referring to that entity, would
+        fail with a ``RecursionError`` when compiling.
+
+    .. change::
+        :tags: bug, orm, regression
+        :tickets: 13709
+
+        Fixed regression caused by the new implementation of ``.params()`` for
+        statements introduced in :ticket:`7066`, where parameter values passed to
+        the ``.params()`` method of an ORM statement created using
+        :meth:`.Select.from_statement` would not be applied when the statement
+        was compiled without the compiled statement cache, such as when the cache
+        was disabled or when the statement was stringified directly, leading to
+        an error that a value is required for the bound parameter.
+
+.. changelog::
+    :version: 2.1.5
+    :released: October 16, 2026
+
+    .. change::
+        :tags: feature, orm
+        :tickets: 13650
+
+        Added the :class:`_orm.Unmapped` annotation and the
+        :func:`_orm.unmapped_column` construct, providing a declarative-compatible
+        approach to having "excluded" columns in a Declarative model, that is,
+        columns that are part of the :class:`_schema.Table` but are not mapped,
+        replacing the use of :paramref:`_orm.Mapper.exclude_properties` for this
+        purpose when using a Declarative mapping.
+
+        .. seealso::
+
+            :ref:`orm_declarative_unmapped_column`
+
+    .. change::
+        :tags: deprecated, orm
+        :tickets: 13650
+
+        Using the :paramref:`_orm.Mapper.exclude_properties` or
+        :paramref:`_orm.Mapper.include_properties` parameters on a Declarative
+        mapping to exclude attributes that are declared on the class, such as with
+        :func:`_orm.mapped_column`, is deprecated and now emits a deprecation
+        warning.  This use was never supported, and depending on the arguments
+        passed to :func:`_orm.mapped_column`, the attribute could remain mapped
+        regardless; in particular, as of 2.1 this includes ORM mapped dataclasses
+        where :paramref:`_orm.mapped_column.default` is present.  The new
+        :func:`_orm.unmapped_column` construct should be used instead.  Excluding
+        columns that are present only in the :class:`_schema.Table`, such as those
+        from ``__table__``, ``__table_args__`` or table reflection, is not
+        affected.
+
+.. changelog::
+    :version: 2.1.4
+    :released: October 7, 2026
+
+    .. change::
+        :tags: bug, engine, regression
+        :tickets: 13639
+
+        Fixed regression where iterating a :class:`.Result` directly would create
+        reference cycles that prevented the :class:`.Result` along with the DBAPI
+        cursor from being freed immediately, instead relying upon cyclic GC to free
+        it; also fixed a similar issue when using scalar-returning methods such as
+        :meth:`.Result.scalars`.  The issues were introduced as part of a 2.1
+        refactoring of :class:`.Result` into Cython code.
+
+
+    .. change::
+        :tags: bug, sql, regression
+        :tickets: 13642
+
+        Fixed regression where stringifying a statement that includes the
+        :class:`_functions.aggregate_strings` function, such as via ``str()``,
+        would raise ``TypeError``.  Additionally, compiling the function with the
+        default dialect or with a third party dialect that doesn't provide its own
+        rendering for this function now raises :class:`.CompileError` rather than
+        ``TypeError``.
+
+    .. change::
+        :tags: bug, postgresql, regression
+        :tickets: 13657
+
+        Fixed regression in the asyncpg dialect where a failure to start a
+        transaction, such as when an asyncpg connection is used from a different
+        event loop than the one it was created on, would leave the failed asyncpg
+        transaction in place, so that the subsequent rollback raised an
+        ``InterfaceError`` that masked the original error.
+
+    .. change::
+        :tags: bug, engine
+        :tickets: 13657
+
+        Fixed issue where an exception raised by the rollback performed within
+        :meth:`_engine.Connection.close`, which was not otherwise classified as a
+        disconnect, would leave the :class:`_engine.Connection` open and its
+        pooled DBAPI connection checked out, emitting a warning when later
+        garbage collected; for an asyncio driver, the connection could not be
+        closed at that point and was leaked.  The DBAPI connection is now
+        returned to the pool, which resets it as usual, invalidating it if that
+        reset fails as well, and the original exception is raised.
+
+    .. change::
+        :tags: bug, orm, regression
+        :tickets: 13659
+
+        Fixed regression caused by :ticket:`13333` where assigning a
+        :class:`.MetaData` object to the ``metadata`` attribute of a mapped
+        Declarative class, in order to place that class's :class:`.Table` in a
+        :class:`.MetaData` collection other than that of the
+        :class:`_orm.registry`, would emit a warning that the attribute name
+        ``metadata`` should be left reserved.  The warning is now emitted only
+        when the ``metadata`` attribute is assigned to an object other than a
+        :class:`.MetaData`.
+
+.. changelog::
+    :version: 2.1.3
+    :released: October 2, 2026
+
+    .. change::
+        :tags: bug, orm, regression
+        :tickets: 13634
+
+        Fixed regression where columns delivered to a mapped class from an
+        unmapped :class:`_orm.MappedAsDataclass` mixin, or from a class decorated
+        with :func:`_orm.unmapped_dataclass`, would not be placed in the
+        :class:`_schema.Table` in the order in which they were declared on the
+        mixin; columns that had no dataclass default, such as a primary key column
+        with no :paramref:`_orm.mapped_column.default`, or which made use of
+        :paramref:`_orm.mapped_column.default_factory`, would be moved after the
+        remaining columns of the mixin.
+
+    .. change::
+        :tags: bug, sql, regression
+        :tickets: 13635
+
+        Fixed regression caused by the new implementation of
+        :meth:`.ExecutableStatement.params` where parameter values established
+        using this method would not be rendered when compiling the statement with
+        the ``literal_binds`` compiler option, instead rendering NULL with a
+        warning.
+
+.. changelog::
+    :version: 2.1.2
+    :released: October 2, 2026
+
+    .. change::
+        :tags: bug, sql
+        :tickets: 13616
+
+        The plain string portions of a :func:`_sql.tstring` construct are no
+        longer scanned for bound parameter names in the ``:name`` format, and no
+        longer interpret the ``\:`` escape sequence; the text is now rendered
+        exactly as given.  Previously, each string portion was parsed in the same
+        way as :func:`_sql.text`, so that a colon within a quoted SQL string, such
+        as ``'time is :now'``, would be rendered as a bound parameter, failing at
+        execution time.
+
+        This change is a breaking change in the behavior of the newly introduced
+        :func:`_sql.tstring` feature, as the former use of ``text()``
+        inadvertently provided a behavior that wasn't intended.  In order to embed
+        an explicit parameter in the SQL generated by :func:`_sql.tstring`,
+        :func:`_sql.bindparam` may be used directly, e.g.
+        ``tstring(t"SELECT {bindparam('p')}")``.
+
+    .. change::
+        :tags: bug, engine, regression
+        :tickets: 13619
+
+        Fixed regression where result rows delivered by the DBAPI as a subclass of
+        ``tuple`` would fail to be processed when the Cython extensions were in
+        use, raising ``TypeError: Expected tuple``.  Such rows are now converted to
+        a plain ``tuple``, as was the case in 2.0.  Rows delivered as a plain
+        ``tuple``, or as a sequence that is not a ``tuple`` at all such as
+        asyncpg's ``Record``, were not affected.  Drivers such as the Databricks
+        SQL connector return rows that are ``tuple`` subclasses.
+
+    .. change::
+        :tags: bug, schema, regression
+        :tickets: 13625
+
+        Fixed issue where the internal copies of :class:`.Enum`,
+        :class:`_postgresql.DOMAIN` and other :class:`.SchemaType` types produced
+        when the type is adapted to a dialect-specific implementation would
+        register themselves with the :class:`.MetaData` collection that is queried
+        by :meth:`.MetaData.get_schema_objects`, in addition to the original type.
+        As a new dialect-level copy is produced for each new :class:`.Dialect`
+        instance, such as each time ``str()`` is called on a statement referring
+        to a column using :class:`.Enum`, the collection would grow without bound
+        and lead to excessive memory use.  Only the type constructed by the user
+        is now registered.
+
+    .. change::
+        :tags: bug, orm, regression
+        :tickets: 13626
+
+        Fixed regression caused by :ticket:`5987` where the :func:`.selectinload`
+        loader strategy would ignore additional criteria present in the
+        :paramref:`_orm.relationship.primaryjoin` of a many-to-many relationship,
+        such as a comparison against a column on the association table or on the
+        parent table, loading related rows that should have been excluded.  The
+        ``omit_join`` optimization for many-to-many relationships is now only used
+        when the primaryjoin consists solely of comparisons between the parent's
+        primary key columns and the association table.
+
+.. changelog::
+    :version: 2.1.1
+    :released: September 25, 2026
+
+    .. change::
+        :tags: bug, platform
+        :tickets: 13604
+
+        Removed the legacy underscore-separated extra names such as
+        ``mssql_pymssql`` and ``postgresql_psycopg`` from ``pyproject.toml``.
+        They normalize to the same names as the existing dash-separated extras,
+        which is disallowed by :pep:`685`, and caused the 2.1.0 source
+        distribution to fail to build with installers that enforce this rule,
+        such as uv. The underscore spellings continue to work when installing,
+        as installers normalize extra names before matching them.
+
+.. changelog::
+    :version: 2.1.0
+    :released: September 24, 2026
+
+    .. change::
+        :tags: feature, orm
+        :tickets: 12575
+
+        Added :paramref:`_orm.composite.column_template` parameter to
+        :func:`_orm.composite`.  When the composite class is a dataclass, this
+        parameter accepts a string template such as ``"person_%s"``, containing
+        exactly one ``%s`` placeholder, that's used to generate column names for
+        dataclass fields that don't otherwise have an explicit name, rather than
+        using the bare field name.  This removes the need to hand-write a
+        :func:`_orm.mapped_column` for each field when the same composite dataclass
+        is mapped multiple times on the same class with different column-name
+        prefixes.  Pull request courtesy Leonardo Rosa.
+
+        .. seealso::
+
+            :ref:`composite_column_template`
+
+    .. change::
+        :tags: usecase, postgresql
+        :tickets: 13577
+
+        PostgreSQL index reflection now reports so-called "invalid" indexes with
+        ``postgresql_invalid=True`` in the Inspector's ``dialect_options``.
+        Reflected :class:`.Index` objects expose this state in the new
+        read-only :attr:`.Index.reflect_only_elements` mapping, separate from
+        DDL options.  Added new marker :attr:`.DialectKWArgConst.REFLECTED_ONLY`
+        which may be used by third party dialects for similar features within
+        the :attr:`.DefaultDialect.construct_arguments` registry.  Pull request
+        courtesy Max Azatian.
+
+        .. seealso::
+
+            :ref:`postgresql_invalid_index_reflection`
+
+    .. change::
+        :tags: bug, mssql
+        :tickets: 13585
+
+        Adjusted the ``mssql+mssqlpython`` dialect for mssql-python version 1.15,
+        which now binds all Python ``Decimal`` values as ``SQL_NUMERIC``.  The
+        conversion of very large and very small ``Decimal`` values to strings,
+        carried over from the pyodbc dialect, is no longer applied for this
+        version of the driver, as the string values would otherwise be converted
+        by SQL Server to the narrower numeric type of other ``Decimal`` values in
+        the same statement, such as within a multiple-row INSERT, raising an
+        arithmetic overflow error.
+
+    .. change::
+        :tags: bug, mssql
+        :tickets: 13585
+
+        Fixed issue where :attr:`.Dialect.dbapi_version` would raise
+        ``AttributeError`` for the ``mssql+mssqlpython`` dialect, as the version
+        was looked up using a ``version`` attribute that is not present on the
+        ``mssql_python`` module, rather than ``__version__``.
+
+.. changelog::
     :version: 2.1.0rc2
+    :released: September 24, 2026
     :released: September 8, 2026
 
     .. change::
@@ -83,6 +561,7 @@
 
 .. changelog::
     :version: 2.1.0rc1
+    :released: September 24, 2026
     :released: August 31, 2026
 
     .. change::
@@ -518,6 +997,7 @@
 
 .. changelog::
     :version: 2.1.0b3
+    :released: September 24, 2026
     :released: June 27, 2026
 
     .. change::
@@ -784,6 +1264,7 @@
 
 .. changelog::
     :version: 2.1.0b2
+    :released: September 24, 2026
     :released: April 16, 2026
 
     .. change::
@@ -917,6 +1398,7 @@
 
 .. changelog::
     :version: 2.1.0b1
+    :released: September 24, 2026
     :released: January 21, 2026
 
     .. change::
@@ -1828,9 +2310,9 @@
 
         The :meth:`_events.SessionEvents.do_orm_execute` event now allows direct
         mutation or replacement of the :attr:`.ORMExecuteState.parameters`
-        dictionary or list, which will take effect when the the statement is
-        executed.  Previously, changes to this collection were not accommodated by
-        the event hook.  Pull request courtesy Shamil.
+        dictionary or list, which will take effect when the statement is executed.
+        Previously, changes to this collection were not accommodated by the event
+        hook.  Pull request courtesy Shamil.
 
 
     .. change::

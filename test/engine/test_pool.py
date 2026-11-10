@@ -1,3 +1,4 @@
+import asyncio
 import collections
 import random
 import threading
@@ -815,6 +816,61 @@ class PoolEventsTest(PoolTestBase):
             is_none(dbapi_connection())
         else:
             is_not_none(dbapi_connection())
+
+    @testing.requires.predictable_gc
+    @testing.variation("is_asyncio", [(True, testing.requires.asyncio), False])
+    def test_checkin_event_gc_reference_cycle(self, is_asyncio):
+        """test #13738; a connection collected as part of a reference cycle
+        is cleaned up, including on Python 3.15 where weakrefs without a
+        callback are cleared only after weakref callbacks have run"""
+
+        p, canary = self._checkin_event_fixture(
+            _is_asyncio=bool(is_asyncio), _has_terminate=True
+        )
+
+        c1 = p.connect()
+        c1.cycle = c1
+        del c1
+
+        eq_(canary, [])
+        eq_(p.checkedout(), 1)
+
+        if is_asyncio:
+            with expect_warnings(
+                "The garbage collector is trying to clean up.*which will "
+                "be terminated."
+            ):
+                gc_collect()
+            eq_(canary, ["reset_no_rollback", "detach", "close_detached"])
+        else:
+            gc_collect()
+            eq_(canary, ["reset_rollback_ok", "checkin"])
+
+        eq_(p.checkedout(), 0)
+
+    @testing.requires.predictable_gc
+    def test_gc_reference_cycle_superseded_fairy(self):
+        """test #13738; a fairy collected as part of a reference cycle
+        doesn't clean up a record that has since been handed to another
+        fairy, as can happen with StaticPool"""
+
+        p = pool.StaticPool(creator=MockDBAPI().connect)
+        canary = []
+        event.listen(p, "checkin", lambda *arg: canary.append("checkin"))
+
+        c1 = p.connect()
+        c1.cycle = c1
+        c2 = p.connect()
+        is_(c1._connection_record, c2._connection_record)
+        del c1
+
+        gc_collect()
+
+        eq_(canary, [])
+        is_true(c2._connection_record.in_use)
+
+        c2.close()
+        eq_(canary, ["checkin"])
 
     def test_checkin_event_on_subsequently_recreated(self):
         p, canary = self._checkin_event_fixture()
@@ -1890,15 +1946,181 @@ class QueuePoolTest(PoolTestBase):
     def test_invalidate(self):
         p = self._queuepool_fixture(pool_size=1, max_overflow=0)
         c1 = p.connect()
-        c_id = c1.dbapi_connection.id
+        dbapi_conn = c1.dbapi_connection
         c1.close()
         c1 = None
         c1 = p.connect()
-        assert c1.dbapi_connection.id == c_id
+        assert c1.dbapi_connection is dbapi_conn
         c1.invalidate()
         c1 = None
         c1 = p.connect()
-        assert c1.dbapi_connection.id != c_id
+        assert c1.dbapi_connection is not dbapi_conn
+
+    @testing.variation("exc_kind", ["cancelled", "interrupted", "error"])
+    @testing.variation("terminate", [True, False])
+    @testing.variation("has_terminate", [True, False])
+    def test_close_connection_logging(
+        self, exc_kind, terminate, has_terminate
+    ):
+        """test #13772; a cancellation of terminate() on a dialect that
+        has terminate is logged at debug, as the connection was force-closed
+        before the cancellation propagated; anything else is an error"""
+
+        dbapi, p = self._queuepool_dbapi_fixture(
+            _is_asyncio=True, _has_terminate=bool(has_terminate)
+        )
+
+        class Interrupted(BaseException):
+            pass
+
+        if exc_kind.cancelled:
+            err = asyncio.CancelledError()
+        elif exc_kind.interrupted:
+            err = Interrupted()
+        elif exc_kind.error:
+            err = Exception("close failed")
+        else:
+            exc_kind.fail()
+
+        dbapi_conn = Mock()
+        close_method = "do_terminate" if terminate else "do_close"
+
+        with (
+            patch.object(p._dialect, close_method, side_effect=err),
+            patch.object(p, "logger") as logger,
+        ):
+            if exc_kind.error:
+                p._close_connection(dbapi_conn, terminate=bool(terminate))
+            else:
+                with expect_raises(type(err)):
+                    p._close_connection(dbapi_conn, terminate=bool(terminate))
+
+        if exc_kind.cancelled and terminate and has_terminate:
+            expected = call.debug(
+                "Cancellation during terminate of connection %r; "
+                "connection was force-closed",
+                dbapi_conn,
+            )
+        else:
+            expected = call.error(
+                f"Exception {'terminating' if terminate else 'closing'} "
+                "connection %r",
+                dbapi_conn,
+                exc_info=True,
+            )
+
+        eq_(
+            logger.mock_calls,
+            [
+                call.debug(
+                    "%s connection %r",
+                    "Hard-closing" if terminate else "Closing",
+                    dbapi_conn,
+                ),
+                expected,
+            ],
+        )
+
+    def test_invalidate_close_interrupted(self):
+        """test #13673"""
+
+        dbapi, p = self._queuepool_dbapi_fixture(
+            pool_size=1, max_overflow=0, _is_asyncio=True, _has_terminate=True
+        )
+
+        class Interrupted(BaseException):
+            pass
+
+        c1 = p.connect()
+        dbapi_conn = c1.dbapi_connection
+        rec = c1._connection_record
+
+        terminate = patch.object(
+            p._dialect, "do_terminate", side_effect=Interrupted()
+        )
+        with terminate, expect_raises(Interrupted):
+            c1.invalidate()
+
+        is_none(rec.dbapi_connection)
+
+        c1.close()
+        c1 = None
+        eq_(p.checkedin(), 1)
+
+        c1 = p.connect()
+        assert c1.dbapi_connection is not dbapi_conn
+        c1.close()
+
+    def test_invalidate_interrupted_before_close(self):
+        """test #13678"""
+
+        dbapi, p = self._queuepool_dbapi_fixture(pool_size=1, max_overflow=0)
+
+        class Interrupted(BaseException):
+            pass
+
+        c1 = p.connect()
+        dbapi_conn = c1.dbapi_connection
+
+        @event.listens_for(p, "invalidate")
+        def invalidate(dbapi_connection, connection_record, exception):
+            raise Interrupted()
+
+        # ensure the soft invalidate time will be later than starttime
+        # for the ConnectionRecord above
+        time.sleep(0.1)
+
+        with expect_raises(Interrupted):
+            c1.invalidate()
+
+        # the record is returned, and the connection it still holds is
+        # not handed out again
+        eq_(p.checkedin(), 1)
+
+        event.remove(p, "invalidate", invalidate)
+        c1 = p.connect()
+        assert c1.dbapi_connection is not dbapi_conn
+
+    def test_reset_interrupted_detaches_fairy(self):
+        """test #13699"""
+
+        dbapi, p = self._queuepool_dbapi_fixture(pool_size=1, max_overflow=0)
+
+        class Interrupted(BaseException):
+            pass
+
+        @event.listens_for(p, "reset")
+        def reset(dbapi_connection, connection_record, reset_state):
+            raise Interrupted()
+
+        c1 = p.connect()
+
+        with expect_raises(Interrupted):
+            c1.close()
+
+        # the record went back to the pool, so the fairy no longer refers
+        # to it
+        eq_(
+            (c1.dbapi_connection, c1._connection_record, p.checkedin()),
+            (None, None, 1),
+        )
+
+        event.remove(p, "reset", reset)
+        c2 = p.connect()
+        c2_dbapi_conn = c2.dbapi_connection
+
+        # the stale fairy can't act on the record now used by c2
+        with expect_warnings("Can't invalidate an already-closed connection"):
+            c1.invalidate()
+
+        eq_(
+            (
+                c2.dbapi_connection,
+                c2_dbapi_conn.close.mock_calls,
+                p.checkedout(),
+            ),
+            (c2_dbapi_conn, [], 1),
+        )
 
     def test_recreate(self):
         p = self._queuepool_fixture(
@@ -1916,16 +2138,16 @@ class QueuePoolTest(PoolTestBase):
 
         dbapi, p = self._queuepool_dbapi_fixture(pool_size=1, max_overflow=0)
         c1 = p.connect()
-        c_id = c1.dbapi_connection.id
+        dbapi_conn = c1.dbapi_connection
         c1.close()
         c1 = None
         c1 = p.connect()
-        assert c1.dbapi_connection.id == c_id
+        assert c1.dbapi_connection is dbapi_conn
         dbapi.raise_error = True
         c1.invalidate()
         c1 = None
         c1 = p.connect()
-        assert c1.dbapi_connection.id != c_id
+        assert c1.dbapi_connection is not dbapi_conn
 
     def test_detach(self):
         dbapi, p = self._queuepool_dbapi_fixture(pool_size=1, max_overflow=0)

@@ -1179,6 +1179,12 @@ construct, the DBAPI's "autocommit" mode must be used::
 PostgreSQL Index Reflection
 ---------------------------
 
+Notes on Index reflection
+
+
+Implicit UNIQUE index for UNIQUE CONSTRAINT
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
 The PostgreSQL database creates a UNIQUE INDEX implicitly whenever the
 UNIQUE CONSTRAINT construct is used.   When inspecting a table using
 :class:`_reflection.Inspector`, the :meth:`_reflection.Inspector.get_indexes`
@@ -1189,8 +1195,38 @@ two constructs distinctly; in the case of the index, the key
 detected as mirroring a constraint.   When performing reflection using
 ``Table(..., autoload_with=engine)``, the UNIQUE INDEX is **not** returned
 in :attr:`_schema.Table.indexes` when it is detected as mirroring a
-:class:`.UniqueConstraint` in the :attr:`_schema.Table.constraints` collection
-.
+:class:`.UniqueConstraint` in the :attr:`_schema.Table.constraints` collection.
+
+.. _postgresql_invalid_index_reflection:
+
+Invalid indexes
+^^^^^^^^^^^^^^^
+
+Indexes marked "invalid" by PostgreSQL (i.e. an index that exists in the
+catalog, but is ignored by the query planner because it may be incomplete,
+while still being maintained on writes) remain present in reflection. The
+:meth:`_reflection.Inspector.get_indexes` and
+:meth:`_reflection.Inspector.get_multi_indexes` methods include
+``postgresql_invalid=True`` in the index's ``dialect_options`` dictionary when
+``pg_index.indisvalid`` is false. Valid indexes omit this flag.
+
+When reflecting a :class:`_schema.Table`, the flag, if present, is stored
+separately from DDL options on each reflected :class:`.Index`::
+
+    table = Table("my_table", MetaData(), autoload_with=engine)
+    for index in table.indexes:
+        if index.reflect_only_elements["postgresql"].get("invalid"):
+            print(index.name)
+
+The :attr:`.Index.reflect_only_elements` mapping is read-only. These values are
+not included in :attr:`.Index.dialect_kwargs` and do not affect DDL.
+
+An invalid index may be left by a failed ``CREATE INDEX CONCURRENTLY``, may
+still be building, or may be a partitioned index awaiting attachment of its
+partition indexes. This flag reports the state at reflection time; it does not
+request an index rebuild.
+
+.. versionadded:: 2.1
 
 Special Reflection Options
 --------------------------
@@ -1617,7 +1653,7 @@ defined, so other SQL dialects may behave differently than PostgreSQL.
 The ``NULLS NOT DISTINCT`` clause can be used to change this behavior, treating
 null values as equal and preventing unintended duplicate rows. The opposite
 ``NULLS DISTINCT`` clause can also be used to make PostgreSQL's default behavior
-explict.
+explicit.
 
 The ``postgresql_nulls_not_distinct`` parameter can be set to ``True`` to
 add the ``NULLS NOT DISTINCT`` clause, or ``False`` to add ``NULLS DISTINCT``.
@@ -1923,6 +1959,7 @@ from .types import REGCLASS as REGCLASS
 from .types import REGCONFIG as REGCONFIG  # noqa: F401
 from .types import TIME as TIME
 from .types import TIMESTAMP as TIMESTAMP
+from .types import TSQUERY as TSQUERY
 from .types import TSVECTOR as TSVECTOR
 from ... import exc
 from ... import schema
@@ -1946,6 +1983,7 @@ from ...sql import functions
 from ...sql import roles
 from ...sql import sqltypes
 from ...sql import util as sql_util
+from ...sql.base import DialectKWArgConst
 from ...sql.compiler import InsertmanyvaluesSentinelOpts
 from ...sql.visitors import InternalTraversal
 from ...types import BIGINT
@@ -2131,6 +2169,8 @@ ischema_names = {
     "boolean": BOOLEAN,
     "interval": INTERVAL,
     "tsvector": TSVECTOR,
+    "tsquery": TSQUERY,
+    "regconfig": REGCONFIG,
 }
 
 
@@ -2746,10 +2786,13 @@ class PGDDLCompiler(compiler.DDLCompiler):
 
     @util.memoized_property
     def _fk_ondelete_pattern(self):
+        # a keyword phrase, optionally followed by the column list accepted
+        # by SET NULL / SET DEFAULT.  column names may be double-quoted, as
+        # rendered by pg_get_constraintdef() when reflected
+        ident = r'(?:[\w$]+|"(?:[^"]|"")+")'
         return re.compile(
-            r"^(?:RESTRICT|CASCADE|SET (?:NULL|DEFAULT)(?:\s*\(.+\))?"
-            r"|NO ACTION)$",
-            re.I,
+            r"^\w+(?:\s+\w+)*"
+            rf"(?:\s*\(\s*{ident}(?:\s*,\s*{ident})*\s*\))?$"
         )
 
     def define_constraint_ondelete_cascade(self, constraint):
@@ -3666,6 +3709,7 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
                 "with": {},
                 "tablespace": None,
                 "nulls_not_distinct": None,
+                "invalid": DialectKWArgConst.REFLECTED_ONLY,
             },
         ),
         (
@@ -4808,8 +4852,12 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
             )
             .outerjoin(
                 pg_catalog.pg_description,
-                pg_catalog.pg_description.c.objoid
-                == pg_catalog.pg_constraint.c.oid,
+                sql.and_(
+                    pg_catalog.pg_description.c.objoid
+                    == pg_catalog.pg_constraint.c.oid,
+                    pg_catalog.pg_description.c.classoid
+                    == sql.func.cast("pg_catalog.pg_constraint", REGCLASS),
+                ),
             )
             .where(
                 pg_catalog.pg_constraint.c.contype == bindparam("contype"),
@@ -5001,8 +5049,12 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
             )
             .outerjoin(
                 pg_catalog.pg_description,
-                pg_catalog.pg_description.c.objoid
-                == pg_catalog.pg_constraint.c.oid,
+                sql.and_(
+                    pg_catalog.pg_description.c.objoid
+                    == pg_catalog.pg_constraint.c.oid,
+                    pg_catalog.pg_description.c.classoid
+                    == sql.func.cast("pg_catalog.pg_constraint", REGCLASS),
+                ),
             )
             .order_by(
                 pg_catalog.pg_class.c.relname,
@@ -5024,8 +5076,9 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
 
         # https://www.postgresql.org/docs/current/static/sql-createtable.html
         return re.compile(
-            r"FOREIGN KEY \((.*?)\) "
-            rf"REFERENCES (?:({qtoken})\.)?({qtoken})\(((?:{qtoken}(?: *, *)?)+)\)"  # noqa: E501
+            rf"FOREIGN KEY \((.*?)(?:, PERIOD ({qtoken}))?\) "
+            rf"REFERENCES (?:({qtoken})\.)?({qtoken})"
+            rf"\(((?:{qtoken}(?: *, *)?)+)(?:, PERIOD ({qtoken}))?\)"
             r"[\s]?(MATCH (FULL|PARTIAL|SIMPLE)+)?"
             r"[\s]?(?:ON (UPDATE|DELETE) "
             r"(CASCADE|RESTRICT|NO ACTION|"
@@ -5043,9 +5096,11 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
 
         (
             constrained_columns,
+            constrained_period_column,
             referred_schema,
             referred_table,
             referred_columns,
+            referred_period_column,
             _,
             match,
             upddelkey1,
@@ -5056,6 +5111,13 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
             _,
             initially,
         ) = m
+
+        # TODO: the PERIOD designation of a temporal foreign key
+        # (PostgreSQL 18+) is not yet reflected
+        if constrained_period_column:
+            constrained_columns += f", {constrained_period_column}"
+        if referred_period_column:
+            referred_columns += f", {referred_period_column}"
 
         onupdate = (
             upddelval1
@@ -5269,6 +5331,7 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
                 pg_catalog.pg_index.c.indrelid,
                 pg_catalog.pg_class.c.relname,
                 pg_catalog.pg_index.c.indisunique,
+                pg_catalog.pg_index.c.indisvalid,
                 pg_catalog.pg_constraint.c.conrelid.is_not(None).label(
                     "has_constraint"
                 ),
@@ -5475,6 +5538,9 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
                             "indnullsnotdistinct"
                         ]
 
+                    if not row["indisvalid"]:
+                        dialect_options["postgresql_invalid"] = True
+
                     if dialect_options:
                         index["dialect_options"] = dialect_options
 
@@ -5590,8 +5656,12 @@ class PGDialect(default._BackendsMultiReflection, default.DefaultDialect):
             )
             .outerjoin(
                 pg_catalog.pg_description,
-                pg_catalog.pg_description.c.objoid
-                == pg_catalog.pg_constraint.c.oid,
+                sql.and_(
+                    pg_catalog.pg_description.c.objoid
+                    == pg_catalog.pg_constraint.c.oid,
+                    pg_catalog.pg_description.c.classoid
+                    == sql.func.cast("pg_catalog.pg_constraint", REGCLASS),
+                ),
             )
             .order_by(
                 pg_catalog.pg_class.c.relname,

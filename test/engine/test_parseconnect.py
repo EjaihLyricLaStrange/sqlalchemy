@@ -345,6 +345,13 @@ class URLTest(fixtures.TestBase):
             url.make_url("drivername:///?%s" % expected),
         )
 
+    def test_difference_update_query_generator(self):
+        u = url.make_url("drivername:///?foo=bar&bat=hi&hoho=lala")
+        eq_(
+            u.difference_update_query(name for name in ["foo", "bat"]),
+            url.make_url("drivername:///?hoho=lala"),
+        )
+
     @testing.combinations(
         "drivername://",
         "drivername://?foo=bar",
@@ -399,6 +406,76 @@ class URLTest(fixtures.TestBase):
             ),
             url.make_url("drivername:///?%s" % expected),
         )
+
+    @testing.combinations(
+        ("x=", {}, {"x": ""}),
+        ("x=&y=1", {"y": "1"}, {"x": "", "y": "1"}),
+        ("x=&x=1", {"x": "1"}, {"x": ("", "1")}),
+        ("x", {}, {"x": ""}),
+        argnames="querystring, default_query, blanks_query",
+    )
+    @testing.variation("keep_blank_values", ["keep", "drop", "omitted"])
+    def test_make_url_blank_values(
+        self, querystring, default_query, blanks_query, keep_blank_values
+    ):
+        urlstr = "dialect://user:pass@host/db?%s" % querystring
+
+        if keep_blank_values.omitted:
+            u = url.make_url(urlstr)
+        else:
+            u = url.make_url(
+                urlstr, keep_blank_values=bool(keep_blank_values.keep)
+            )
+
+        if keep_blank_values.keep:
+            eq_(u.query, blanks_query)
+        else:
+            eq_(u.query, default_query)
+
+    @testing.combinations(
+        ("x=", {}, {"x": ""}),
+        ("x=&y=1", {"y": "1"}, {"x": "", "y": "1"}),
+        ("z=", {"z": "2"}, {"z": ""}),
+        argnames="querystring, default_query, blanks_query",
+    )
+    @testing.variation("keep_blank_values", ["keep", "drop", "omitted"])
+    def test_update_query_string_blank_values(
+        self, querystring, default_query, blanks_query, keep_blank_values
+    ):
+        u = url.make_url("dialect://user:pass@host/db?z=2")
+
+        if keep_blank_values.omitted:
+            u = u.update_query_string(querystring)
+        else:
+            u = u.update_query_string(
+                querystring, keep_blank_values=bool(keep_blank_values.keep)
+            )
+
+        if keep_blank_values.keep:
+            eq_(u.query, {"z": "2", **blanks_query})
+        else:
+            eq_(u.query, {"z": "2", **default_query})
+
+    def test_blank_values_round_trip(self):
+        u1 = url.URL.create(
+            "dialect",
+            username="user",
+            password="pass",
+            host="host",
+            query={"x": "", "y": "1"},
+        )
+        urlstr = u1.render_as_string(hide_password=False)
+        eq_(urlstr, "dialect://user:pass@host?x=&y=1")
+
+        eq_(url.make_url(urlstr).query, {"y": "1"})
+
+        u2 = url.make_url(urlstr, keep_blank_values=True)
+        eq_(u2.query, {"x": "", "y": "1"})
+        eq_(u2, u1)
+
+    def test_make_url_blank_values_url_passthrough(self):
+        u1 = url.make_url("dialect://user:pass@host/db?x=1")
+        is_(url.make_url(u1, keep_blank_values=True), u1)
 
     @testing.combinations("username", "host", "database", argnames="argname")
     @testing.combinations((35.8), (True,), argnames="value")

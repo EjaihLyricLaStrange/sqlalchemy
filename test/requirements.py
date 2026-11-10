@@ -4,6 +4,7 @@ from sqlalchemy import exc
 from sqlalchemy.sql import sqltypes
 from sqlalchemy.sql import text
 from sqlalchemy.testing import exclusions
+from sqlalchemy.testing import profiling
 from sqlalchemy.testing.exclusions import against
 from sqlalchemy.testing.exclusions import fails_if
 from sqlalchemy.testing.exclusions import fails_on
@@ -1525,9 +1526,30 @@ class DefaultRequirements(SuiteRequirements):
     @property
     def datetime_historic(self):
         """target dialect supports representation of Python
-        datetime.datetime() objects with historic (pre 1900) values."""
+        datetime.datetime() objects with historic values, meaning any
+        year from ``datetime.MINYEAR`` forward, or from the year
+        given by :meth:`.Dialect.min_year_for_type` if later."""
 
-        return succeeds_if(["sqlite", "postgresql"])
+        return exclusions.open()
+
+    @property
+    def datetime_timezone_historic(self):
+        """target dialect supports representation of Python
+        datetime.datetime() objects with tzinfo with
+        DateTime(timezone=True), with historic values, meaning any
+        year from ``datetime.MINYEAR`` forward, or from the year
+        given by :meth:`.Dialect.min_year_for_type` if later."""
+
+        return (
+            only_on(["postgresql", "mssql"])
+            + skip_if(
+                "+pg8000",
+                "pg8000 returns a string for UTC offsets that include "
+                "seconds, as PostgreSQL reports for historic dates in "
+                "local mean time",
+            )
+            + skip_if("+pymssql", "offsets dont seem to work")
+        )
 
     @property
     def date(self):
@@ -1547,9 +1569,11 @@ class DefaultRequirements(SuiteRequirements):
     @property
     def date_historic(self):
         """target dialect supports representation of Python
-        datetime.datetime() objects with historic (pre 1900) values."""
+        datetime.date() objects with historic values, meaning any
+        year from ``datetime.MINYEAR`` forward, or from the year
+        given by :meth:`.Dialect.min_year_for_type` if later."""
 
-        return succeeds_if(["sqlite", "postgresql"])
+        return exclusions.open()
 
     @property
     def time(self):
@@ -1577,6 +1601,16 @@ class DefaultRequirements(SuiteRequirements):
         to represent very small values."""
         # NOTE: this exclusion isn't used in current tests.
         return exclusions.open()
+
+    @property
+    def float_cast(self):
+        """target backend supports CAST to a FLOAT type"""
+
+        return skip_if(
+            lambda config: against(config, ["mysql", "mariadb"])
+            and not config.db.dialect._support_float_cast,
+            "MySQL < 8.0.17 / MariaDB < 10.4.5 can't CAST to FLOAT",
+        )
 
     @property
     def precision_numerics_many_significant_digits(self):
@@ -1678,7 +1712,7 @@ class DefaultRequirements(SuiteRequirements):
 
         """
 
-        return fails_on("+mssqlpython")
+        return fails_on("+mssqlpython<1.15")
 
     @property
     def fetch_null_from_numeric(self):
@@ -2133,7 +2167,28 @@ class DefaultRequirements(SuiteRequirements):
 
     @property
     def python_profiling_backend(self):
-        return only_on([self._sqlite_memory_db])
+        """target is the in-memory SQLite database used for profiling
+        tests that measure Python overhead only, and profiles.txt has
+        counts for it."""
+
+        return only_on([self._sqlite_memory_db]) + self.dbapi_profiling_backend
+
+    @property
+    def dbapi_profiling_backend(self):
+        """profiles.txt has counts for the current platform, including
+        python version, driver and cext.
+
+        Test classes that make use of profiling.function_call_count()
+        should require either this or python_profiling_backend, so that
+        the class isn't generated, and therefore doesn't run its fixture
+        setup, for platforms where every test would skip anyway.
+
+        """
+
+        return only_if(
+            lambda config: profiling._profile_stats.has_platform(config.db),
+            "no profiling counts in profiles.txt for this platform",
+        )
 
     @property
     def computed_columns_stored(self):

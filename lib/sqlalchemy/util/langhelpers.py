@@ -377,7 +377,7 @@ def _linecache_cache_getter():
 
     linecache.cache despite being non-underscored and widely used is
     nonetheless not documented by cPython.   Therefore we cannot trust that it
-    it's present in third party Python distributions, or that it wont
+    it's present in third party Python distributions, or that it won't
     suddenly be removed or changed.  Guard against this such that linecache
     features will be silently disabled if this should happen.  Unit tests in
     test/base/test_utils.py ensures linecache.cache remains available for new
@@ -404,7 +404,13 @@ def _remove_linecache_entry(filename: str, entry: _LinecacheEntry) -> None:
     linecache within exec_code_in_env.
 
     """
-    linecache_cache = _linecache_cache_getter()
+    try:
+        linecache_cache = _linecache_cache_getter()
+    except AttributeError:
+        # linecache.cache is gone or is no longer a dict; as this runs
+        # from a finalizer, an exception here would only surface as an
+        # unraisable error
+        return
 
     if linecache_cache.get(filename) is entry:
         linecache_cache.pop(filename, None)
@@ -457,7 +463,7 @@ def exec_code_in_env(
         )
         # atexit is a property on the C implementation; typeshed
         # renders finalize with an empty __slots__
-        finalizer.atexit = False  # type: ignore[misc]
+        finalizer.atexit = False
 
     return fn  # type: ignore[no-any-return]
 
@@ -1040,6 +1046,8 @@ def class_hierarchy(cls):
     Fibs slightly: subclasses of builtin types are not returned.  Thus
     class_hierarchy(class A(object)) returns (A, object), not A plus every
     class systemwide that derives from object.
+    Likewise, class_hierarchy(class A(Generic[T])) returns
+    (A, Generic, object), not every class systemwide that derives from Generic.
 
     """
 
@@ -1053,7 +1061,11 @@ def class_hierarchy(cls):
             process.append(b)
             hier.add(b)
 
-        if c.__module__ == "builtins" or not hasattr(c, "__subclasses__"):
+        if (
+            c is Generic
+            or c.__module__ == "builtins"
+            or not hasattr(c, "__subclasses__")
+        ):
             continue
 
         for s in [

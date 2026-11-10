@@ -1,7 +1,6 @@
 import decimal
 import gc
 import itertools
-import multiprocessing
 import pickle
 import weakref
 
@@ -16,6 +15,7 @@ from sqlalchemy import MetaData
 from sqlalchemy import select
 from sqlalchemy import String
 from sqlalchemy import testing
+from sqlalchemy import type_coerce
 from sqlalchemy import types
 from sqlalchemy import Unicode
 from sqlalchemy import util
@@ -114,139 +114,57 @@ def profile_memory(
             else:
                 return gc.get_objects()
 
-        def profile(queue, func_args):
-            # give testing.db a brand new pool and don't
-            # touch the existing pool, since closing a socket
-            # in the subprocess can affect the parent
-            testing.db.pool = testing.db.pool.recreate()
-
+        def profile(*func_args):
             gc_collect()
             samples = []
             max_ = 0
             max_grew_for = 0
-            success = False
             until_maxtimes = 0
-            try:
-                while True:
-                    if until_maxtimes >= maxtimes // 5:
-                        break
-                    for x in range(5):
-                        try:
-                            func(*func_args)
-                        except Exception as err:
-                            queue.put(
-                                (
-                                    "result",
-                                    False,
-                                    "Test raised an exception: %r" % err,
-                                )
-                            )
+            while True:
+                if until_maxtimes >= maxtimes // 5:
+                    break
+                for x in range(5):
+                    func(*func_args)
 
-                            raise
+                    gc_collect()
 
-                        gc_collect()
-
-                        samples.append(
-                            get_num_objects()
-                            if get_num_objects is not None
-                            else len(get_objects_skipping_sqlite_issue())
-                        )
-
-                    if assert_no_sessions:
-                        assert len(_sessions) == 0, "%d sessions remain" % (
-                            len(_sessions),
-                        )
-
-                    # queue.put(('samples', samples))
-
-                    latest_max = max(samples[-5:])
-                    if latest_max > max_:
-                        queue.put(
-                            (
-                                "status",
-                                "Max grew from %s to %s, max has "
-                                "grown for %s samples"
-                                % (max_, latest_max, max_grew_for),
-                            )
-                        )
-                        max_ = latest_max
-                        max_grew_for += 1
-                        until_maxtimes += 1
-                        continue
-                    else:
-                        queue.put(
-                            (
-                                "status",
-                                "Max remained at %s, %s more attempts left"
-                                % (max_, max_grew_for),
-                            )
-                        )
-                        max_grew_for -= 1
-                        if max_grew_for == 0:
-                            success = True
-                            break
-            except Exception as err:
-                queue.put(("result", False, "got exception: %s" % err))
-            else:
-                if not success:
-                    queue.put(
-                        (
-                            "result",
-                            False,
-                            "Ran for a total of %d times, memory kept "
-                            "growing: %r" % (maxtimes, samples),
-                        )
+                    samples.append(
+                        get_num_objects()
+                        if get_num_objects is not None
+                        else len(get_objects_skipping_sqlite_issue())
                     )
 
+                if assert_no_sessions:
+                    assert len(_sessions) == 0, "%d sessions remain" % (
+                        len(_sessions),
+                    )
+
+                latest_max = max(samples[-5:])
+                if latest_max > max_:
+                    print(
+                        "Max grew from %s to %s, max has "
+                        "grown for %s samples"
+                        % (max_, latest_max, max_grew_for)
+                    )
+                    max_ = latest_max
+                    max_grew_for += 1
+                    until_maxtimes += 1
+                    continue
                 else:
-                    queue.put(("result", True, "success"))
+                    print(
+                        "Max remained at %s, %s more attempts left"
+                        % (max_, max_grew_for)
+                    )
+                    max_grew_for -= 1
+                    if max_grew_for == 0:
+                        return
 
-        def run_plain(*func_args):
-            import queue as _queue
+            raise AssertionError(
+                "Ran for a total of %d times, memory kept growing: %r"
+                % (maxtimes, samples)
+            )
 
-            q = _queue.Queue()
-            profile(q, func_args)
-
-            while True:
-                row = q.get()
-                typ = row[0]
-                if typ == "samples":
-                    print("sample gc sizes:", row[1])
-                elif typ == "status":
-                    print(row[1])
-                elif typ == "result":
-                    break
-                else:
-                    assert False, "can't parse row"
-            assert row[1], row[2]
-
-        # return run_plain
-
-        def run_in_process(*func_args):
-            # see
-            # https://docs.python.org/3.14/whatsnew/3.14.html
-            # #incompatible-changes - the default run type is no longer
-            # "fork", but since we are running closures in the process
-            # we need forked mode
-            ctx = multiprocessing.get_context("fork")
-            queue = ctx.Queue()
-            proc = ctx.Process(target=profile, args=(queue, func_args))
-            proc.start()
-            while True:
-                row = queue.get()
-                typ = row[0]
-                if typ == "samples":
-                    print("sample gc sizes:", row[1])
-                elif typ == "status":
-                    print(row[1])
-                elif typ == "result":
-                    break
-                else:
-                    assert False, "can't parse row"
-            proc.join()
-            assert row[1], row[2]
-
-        return run_in_process
+        return profile
 
     return decorate
 
@@ -1553,7 +1471,7 @@ class CycleTest(_fixtures.FixtureTest):
 
         stmt = s.query(User).join(User.addresses).statement
 
-        @assert_cycles(21)
+        @assert_cycles()
         def go():
             result = s.execute(stmt)
             rows = result.fetchall()  # noqa
@@ -1568,7 +1486,7 @@ class CycleTest(_fixtures.FixtureTest):
 
         stmt = s.query(User).join(User.addresses).statement
 
-        @assert_cycles(21)
+        @assert_cycles()
         def go():
             result = s.execute(stmt)
             for partition in result.partitions(3):
@@ -1584,11 +1502,69 @@ class CycleTest(_fixtures.FixtureTest):
 
         stmt = s.query(User).join(User.addresses).statement
 
-        @assert_cycles(21)
+        @assert_cycles()
         def go():
             result = s.execute(stmt)
             for partition in result.unique().partitions(3):
                 pass
+
+        go()
+
+    @testing.variation(
+        "method",
+        [
+            "iterate",
+            "iterate_unique",
+            "iterate_scalars",
+            "scalars_all",
+            "fetchone",
+            "fetchall",
+            "partitions",
+        ],
+    )
+    @testing.variation("processors", [True, False])
+    def test_core_result_consume(self, connection, method, processors):
+        """test #13639"""
+
+        users = self.tables.users
+
+        if processors:
+
+            class MyInt(types.TypeDecorator):
+                impl = Integer
+                cache_ok = True
+
+                def process_result_value(self, value, dialect):
+                    return value
+
+            stmt = select(type_coerce(users.c.id, MyInt()), users.c.name)
+        else:
+            stmt = select(users.c.id, users.c.name)
+
+        @assert_cycles()
+        def go():
+            result = connection.execute(stmt)
+            if method.iterate:
+                for row in result:
+                    pass
+            elif method.iterate_unique:
+                for row in result.unique():
+                    pass
+            elif method.iterate_scalars:
+                for value in result.scalars():
+                    pass
+            elif method.scalars_all:
+                result.scalars().all()
+            elif method.fetchone:
+                while result.fetchone() is not None:
+                    pass
+            elif method.fetchall:
+                result.fetchall()
+            elif method.partitions:
+                for partition in result.partitions(2):
+                    pass
+            else:
+                method.fail()
 
         go()
 

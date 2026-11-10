@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import enum
 import functools
+import itertools
 import re
 import types
 import typing
@@ -60,6 +61,7 @@ from .base import ORMDescriptor
 from .base import state_attribute_str as state_attribute_str  # noqa: F401
 from .base import state_class_str as state_class_str  # noqa: F401
 from .base import state_str as state_str  # noqa: F401
+from .base import Unmapped
 from .base import WriteOnlyMapped
 from .interfaces import CriteriaOption
 from .interfaces import MapperProperty as MapperProperty
@@ -105,6 +107,7 @@ if typing.TYPE_CHECKING:
     from ._typing import _ORMCOLEXPR
     from .context import _MapperEntity
     from .context import _ORMCompileState
+    from .context import _ORMSelectCompileState
     from .decl_api import RegistryType
     from .mapper import Mapper
     from .path_registry import _AbstractEntityRegistry
@@ -150,6 +153,7 @@ _de_stringify_partial = functools.partial(
             "Mapped": Mapped,
             "WriteOnlyMapped": WriteOnlyMapped,
             "DynamicMapped": DynamicMapped,
+            "Unmapped": Unmapped,
         }
     ),
 )
@@ -633,6 +637,41 @@ class ORMAdapter(sql_util.ColumnAdapter):
         return not entity or entity.isa(self.mapper) or self.mapper.isa(entity)
 
 
+def _is_alias_of_selectable(
+    selectable: FromClause, target: FromClause
+) -> bool:
+    """Return True if ``selectable`` is ``target``, or a plain alias of it,
+    including a flat alias of a join of the same structure and join types."""
+
+    if selectable is target or (
+        isinstance(selectable, expression.Alias)
+        and selectable.element is target
+    ):
+        return True
+
+    return all(
+        elem is tgt
+        or (isinstance(elem, expression.Alias) and elem.element is tgt)
+        or (
+            # zip_longest() pads the shorter of the two with None
+            elem is not None
+            and tgt is not None
+            and elem._is_join
+            and tgt._is_join
+            and elem.isouter == tgt.isouter
+            and elem.full == tgt.full
+        )
+        or (
+            isinstance(elem, expression.FromGrouping)
+            and isinstance(tgt, expression.FromGrouping)
+        )
+        for elem, tgt in itertools.zip_longest(
+            sql_util.surface_selectables(selectable),
+            sql_util.surface_selectables(target),
+        )
+    )
+
+
 class AliasedClass(
     inspection.Inspectable["AliasedInsp[_O]"], ORMColumnsClauseRole[_O]
 ):
@@ -718,9 +757,38 @@ class AliasedClass(
         nest_adapters = False
 
         if alias is None:
-            if insp.is_aliased_class and insp.selectable._is_subquery:
-                alias = insp.selectable.alias()
-            else:
+            if insp_is_aliased_class(insp):
+                if insp._is_with_polymorphic:
+                    # polymorphic arguments are only passed along with an
+                    # explicit selectable, by with_polymorphic() and
+                    # AliasedInsp._merge_with()
+                    assert (
+                        not with_polymorphic_mappers
+                        and with_polymorphic_discriminator is None
+                        and not represents_outer_join
+                    )
+
+                    # aliased() of a with_polymorphic() carries along its
+                    # polymorphic configuration, #13584
+                    with_polymorphic_mappers = insp.with_polymorphic_mappers
+                    with_polymorphic_discriminator = insp.polymorphic_on
+                    represents_outer_join = insp.represents_outer_join
+
+                if not _is_alias_of_selectable(
+                    insp.selectable, mapper._with_polymorphic_selectable
+                ):
+                    # aliased() of an aliased() that refers to a subquery,
+                    # CTE, with_polymorphic() or other selectable; alias
+                    # that selectable rather than the mapped table,
+                    # #13583, #13584
+                    alias = insp.selectable._anonymous_fromclause(
+                        name=name, flat=flat
+                    )
+                    adapt_on_names = adapt_on_names or insp._adapt_on_names
+                elif insp.selectable._is_subquery:
+                    alias = insp.selectable.alias()
+
+            if alias is None:
                 alias = (
                     mapper._with_polymorphic_selectable._anonymous_fromclause(
                         name=name,
@@ -925,6 +993,7 @@ class AliasedInsp(
     _adapter: ORMAdapter
     with_polymorphic_mappers: Sequence[Mapper[Any]]
     _with_polymorphic_entities: Sequence[AliasedInsp[Any]]
+    _adapt_on_names: bool
 
     _weak_entity: weakref.ref[AliasedClass[_O]]
     """the AliasedClass that refers to this AliasedInsp"""
@@ -1480,15 +1549,12 @@ class LoaderCriteriaOption(CriteriaOption):
                 else:
                     stack.extend(subclass.__subclasses__())
 
-    def _should_include(self, compile_state: _ORMCompileState) -> bool:
-        if (
-            compile_state.select_statement._annotations.get(
-                "for_loader_criteria", None
-            )
-            is self
-        ):
-            return False
-        return True
+    def _should_include(self, compile_state: _ORMSelectCompileState) -> bool:
+        # don't apply the criteria to a SELECT that's part of the criteria
+        # itself, either directly or nested at any level within other
+        # SELECTs, such as another option's criteria that in turn refers
+        # back to our entity; this would otherwise recurse endlessly (#13714)
+        return self not in compile_state._containing_loader_criteria
 
     def _resolve_where_criteria(
         self, ext_info: _InternalEntityType[Any]
@@ -2344,6 +2410,34 @@ def _cleanup_mapped_str_annotation(
     return annotation
 
 
+_mapped_str_annotation = re.compile(r"(?:Mapped|Unmapped)\[")
+
+
+def _unresolved_annotation_is_mapped(
+    raw_annotation: _AnnotationScanType,
+) -> bool:
+    """given an un-resolvable annotation, guess if it's ``Mapped[]``.
+
+    Used only to decide whether a ``NameError`` raised while de-stringifying
+    is worth reporting as a mapping error.  The annotation may be a plain
+    string (``__future__`` annotations / explicitly quoted), a ``ForwardRef``
+    (:pep:`649` deferred annotations on Python 3.14 and above), or an
+    already-resolved object.
+
+    """
+    if isinstance(raw_annotation, str):
+        return bool(_mapped_str_annotation.search(raw_annotation))
+    elif isinstance(raw_annotation, typing.ForwardRef):
+        return bool(
+            _mapped_str_annotation.search(raw_annotation.__forward_arg__)
+        )
+    else:
+        origin = typing.get_origin(raw_annotation)
+        return isinstance(origin, type) and issubclass(
+            origin, _MappedAnnotationBase
+        )
+
+
 def _extract_mapped_subtype(
     raw_annotation: Optional[_AnnotationScanType],
     cls: type,
@@ -2390,7 +2484,7 @@ def _extract_mapped_subtype(
             "module level. See chained stack trace for more hints."
         ) from ce
     except NameError as ne:
-        if raiseerr and "Mapped[" in raw_annotation:  # type: ignore[operator]
+        if raiseerr and _unresolved_annotation_is_mapped(raw_annotation):
             raise orm_exc.MappedAnnotationError(
                 f"Could not interpret annotation {raw_annotation}.  "
                 "Check that it uses names that are correctly imported at the "

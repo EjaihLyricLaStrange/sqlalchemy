@@ -15,7 +15,6 @@ from sqlalchemy import literal_column
 from sqlalchemy import not_
 from sqlalchemy import or_
 from sqlalchemy import select
-from sqlalchemy import sql
 from sqlalchemy import String
 from sqlalchemy import testing
 from sqlalchemy import text
@@ -24,7 +23,6 @@ from sqlalchemy import TypeDecorator
 from sqlalchemy import union
 from sqlalchemy import union_all
 from sqlalchemy import VARCHAR
-from sqlalchemy.engine import default
 from sqlalchemy.sql import LABEL_STYLE_TABLENAME_PLUS_COL
 from sqlalchemy.sql.selectable import LABEL_STYLE_NONE
 from sqlalchemy.testing import assert_raises_message
@@ -287,39 +285,6 @@ class QueryTest(fixtures.TablesTest):
         )
         r = connection.execute(s, dict(userid="fred")).fetchall()
         assert len(r) == 1
-
-    def test_bindparam_detection(self):
-        dialect = default.DefaultDialect(paramstyle="qmark")
-
-        def prep(q):
-            return str(sql.text(q).compile(dialect=dialect))
-
-        def a_eq(got, wanted):
-            if got != wanted:
-                print("Wanted %s" % wanted)
-                print("Received %s" % got)
-            self.assert_(got == wanted, got)
-
-        a_eq(prep("select foo"), "select foo")
-        a_eq(prep("time='12:30:00'"), "time='12:30:00'")
-        a_eq(prep("time='12:30:00'"), "time='12:30:00'")
-        a_eq(prep(":this:that"), ":this:that")
-        a_eq(prep(":this :that"), "? ?")
-        a_eq(prep("(:this),(:that :other)"), "(?),(? ?)")
-        a_eq(prep("(:this),(:that:other)"), "(?),(:that:other)")
-        a_eq(prep("(:this),(:that,:other)"), "(?),(?,?)")
-        a_eq(prep("(:that_:other)"), "(:that_:other)")
-        a_eq(prep("(:that_ :other)"), "(? ?)")
-        a_eq(prep("(:that_other)"), "(?)")
-        a_eq(prep("(:that$other)"), "(?)")
-        a_eq(prep("(:that$:other)"), "(:that$:other)")
-        a_eq(prep(".:that$ :other."), ".? ?.")
-
-        a_eq(prep(r"select \foo"), r"select \foo")
-        a_eq(prep(r"time='12\:30:00'"), r"time='12\:30:00'")
-        a_eq(prep(r":this \:that"), "? :that")
-        a_eq(prep(r"(\:that$other)"), "(:that$other)")
-        a_eq(prep(r".\:that$ :other."), ".:that$ ?.")
 
     @testing.requires.standalone_binds
     def test_select_from_bindparam(self, connection):
@@ -676,6 +641,52 @@ class QueryTest(fixtures.TablesTest):
                 stmt, {"uname": ["jack", "fred", "ed"], "userid": [8, 9]}
             ).fetchall(),
             [(8, "fred"), (9, "ed")],
+        )
+
+    @testing.variation("other_expanding", [True, False])
+    def test_expanding_in_element_name_collision(
+        self, connection, other_expanding
+    ):
+        """test #13695
+
+        the first element of the expanding parameter ``q`` would be named
+        ``q_1``, which is the name of the other parameter.
+
+        """
+        users = self.tables.users
+
+        connection.execute(
+            users.insert(),
+            [
+                dict(user_id=7, user_name="jack"),
+                dict(user_id=8, user_name="fred"),
+                dict(user_id=9, user_name="ed"),
+            ],
+        )
+
+        if other_expanding:
+            other_crit = users.c.user_name.in_(
+                bindparam("q_1", expanding=True)
+            )
+            other_value = ["jack", "ed"]
+        else:
+            other_crit = users.c.user_name == bindparam("q_1")
+            other_value = "jack"
+
+        stmt = (
+            select(users)
+            .where(
+                users.c.user_id.in_(bindparam("q", expanding=True)),
+                other_crit,
+            )
+            .order_by(users.c.user_id)
+        )
+
+        eq_(
+            connection.execute(
+                stmt, {"q": [7, 8], "q_1": other_value}
+            ).fetchall(),
+            [(7, "jack")],
         )
 
     def test_expanding_in_repeated(self, connection):

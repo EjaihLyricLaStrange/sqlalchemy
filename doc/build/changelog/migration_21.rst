@@ -604,7 +604,10 @@ A late addition to the behavioral change brings equivalent behavior to the
 use of the :paramref:`_orm.relationship.default_factory` parameter with
 collection-based relationships.   This parameter is :ref:`documented <orm_declarative_dc_relationships>`
 as being limited to exactly the collection class that's stated on the left side
-of the annotation, which is now enforced at mapper configuration time::
+of the annotation (or for a custom
+:paramref:`_orm.relationship.collection_class`, the plain ``list``, ``set``
+or ``dict`` type that it's based on), which is now enforced at mapper
+configuration time::
 
     class Parent(Base):
         __tablename__ = "parents"
@@ -650,6 +653,83 @@ This change includes the following API changes:
   ORM mapped classes.
 
 :ticket:`12168`
+
+.. _change_13650:
+
+Excluding declared attributes with ``exclude_properties`` is deprecated; use ``unmapped_column()``
+--------------------------------------------------------------------------------------------------
+
+A consequence of the change described at :ref:`change_12168` is that an ORM
+Mapped Dataclass attribute which includes
+:paramref:`_orm.mapped_column.default` remains mapped even if the attribute is
+named in :paramref:`_orm.Mapper.exclude_properties`, or is omitted from
+:paramref:`_orm.Mapper.include_properties`.  In the mapping below, the intent
+is that ``legacy_status`` is a column in the ``some_table`` table that is not
+part of the ``SomeObject`` class::
+
+    class Base(MappedAsDataclass, DeclarativeBase):
+        pass
+
+
+    class SomeObject(Base):
+        __tablename__ = "some_table"
+        __mapper_args__ = {"exclude_properties": ["legacy_status"]}
+
+        id: Mapped[int] = mapped_column(primary_key=True, init=False)
+        data: Mapped[str]
+        legacy_status: Mapped[str] = mapped_column(default="default_status")
+
+In SQLAlchemy 2.0, the above mapping would omit ``legacy_status`` from the
+:class:`_orm.Mapper`.  In 2.1, the descriptor that delivers the dataclass-level
+default is established for the attribute up front, so that the attribute is
+mapped regardless of the ``exclude_properties`` setting, and the column is
+included in SELECT, INSERT and UPDATE statements as with any other mapped
+column.
+
+Using :paramref:`_orm.mapped_column.insert_default` in place of
+:paramref:`_orm.mapped_column.default`, along with
+:paramref:`_orm.mapped_column.init` set to ``False``, slightly improves the
+situation, as no dataclass-level default is present and the attribute is then
+omitted from the :class:`_orm.Mapper` as well as from the ``__init__()``
+method.  However, the attribute is still not fully omitted from the dataclass;
+it remains a dataclass field that has no corresponding attribute on the
+instance, so that dataclass-generated methods such as ``__repr__()`` and
+``__eq__()``, as well as functions such as ``dataclasses.asdict()``, raise
+``AttributeError``.
+
+The use of :paramref:`_orm.Mapper.exclude_properties` and
+:paramref:`_orm.Mapper.include_properties` to exclude an attribute that is
+itself declared on the class was never a supported pattern; these parameters
+are intended for columns that are present only in the :class:`_schema.Table`,
+such as when using ``__table__``, ``__table_args__`` or table reflection.  As
+of 2.1.5, this use is deprecated and emits a deprecation warning, whether or
+not the attribute in question is ultimately excluded.
+
+To declare a column that is part of the :class:`_schema.Table` but is not
+mapped, the new :class:`_orm.Unmapped` annotation and
+:func:`_orm.unmapped_column` construct are used instead, which are also new as
+of 2.1.5::
+
+    class SomeObject(Base):
+        __tablename__ = "some_table"
+
+        id: Mapped[int] = mapped_column(primary_key=True, init=False)
+        data: Mapped[str]
+        legacy_status: Unmapped[str] = unmapped_column(default="default_status")
+
+Above, ``legacy_status`` is present in the ``some_table`` table, and is omitted
+from the :class:`_orm.Mapper`, from the dataclass and from its ``__init__()``
+method.  As :func:`_orm.unmapped_column` configures only the
+:class:`_schema.Column`, the :paramref:`_orm.unmapped_column.default`
+parameter is strictly a Core level column default, passed along to
+:paramref:`_schema.Column.default`, which continues to take effect when the ORM
+emits an INSERT for the class.
+
+.. seealso::
+
+    :ref:`orm_declarative_unmapped_column`
+
+:ticket:`13650`
 
 .. _change_9809:
 
@@ -802,6 +882,58 @@ otherwise made by ORM Annotated Declarative.
 
 :ticket:`12570`
 
+.. _change_13507:
+
+Loader options from a deeper path no longer apply to an object loaded at the top
+---------------------------------------------------------------------------------
+
+The same object can be loaded more than once within a single query.  Given
+``A.b`` referring to ``B``, ``B.a`` referring back to ``A``, and ``A.c``
+referring to ``C``, the query below loads ``A`` twice: once as the entity
+being selected, and again underneath ``A.b -> B.a``::
+
+    stmt = select(A).options(
+        joinedload(A.b).joinedload(B.a).raiseload("*"),
+        joinedload(A.c),
+    )
+
+    a = session.scalars(stmt).unique().one()
+
+SQLAlchemy remembers which of those two paths an object was loaded under, and
+applies the loader options from that path whenever more SQL is emitted for the
+object later on::
+
+    session.expire(a)
+
+    a.value  # refresh, emitting SELECT for the "a" row
+
+    a.c  # 2.0: raises InvalidRequestError; 2.1: loads normally
+
+In 2.0 it was difficult to predict which of the paths would be the one
+remembered, as it varied with the loader strategy in use, so the
+``raiseload("*")`` written for ``A.b -> B.a`` could end up applied to ``a``
+itself.  In 2.1 the shallowest path is favored, a deterministic rule rather
+than one based on which loader strategy within the query happened to see the
+object first.
+
+This applies to all forms of :term:`lazy loading`, such as when expired
+attributes are unexpired, deferred columns are loaded, or unloaded
+relationships are loaded::
+
+    stmt = select(A).options(
+        joinedload(A.b).joinedload(B.a).lazyload(A.c).joinedload(C.d),
+    )
+
+    a = session.scalars(stmt).unique().one()
+
+    a.c  # 2.0: SELECT from "c" with a JOIN to "d"; 2.1: SELECT from "c"
+
+Code that relies on complex interactions of overlapping paths may need
+adjustment, as the behavior should now be consistent across the different
+kinds of loader option.
+
+:ticket:`13507`
+
 
 Core - New Features
 ===================
@@ -820,7 +952,14 @@ template strings.
 The :func:`_sql.tstring` function works similarly to :func:`_sql.text`, but
 automatically handles different types of interpolated values:
 
-* **String literals** from the template are rendered directly as SQL
+* **String literals** from the template are rendered directly as SQL;
+  unlike :func:`_sql.text`, they are not scanned for ``:name`` bound
+  parameters
+
+  .. versionchanged:: 2.1.2 String literals within a :func:`_sql.tstring`
+     are no longer scanned for ``:name`` bound parameters or ``\:``
+     escapes, as was the case in 2.1.0 and 2.1.1.
+
 * **SQLAlchemy expressions** (columns, functions, subqueries, etc.) are
   embedded as clause elements
 * **Plain Python values** are automatically wrapped with :func:`_sql.literal`
@@ -1259,58 +1398,6 @@ However, attempting to use non-integer values in the tuple syntax will now
 raise an error, directing users to use :class:`_sql.FrameClause` instead.
 
 :ticket:`12596`
-
-.. _change_13507:
-
-Loader options from a deeper path no longer apply to an object loaded at the top
----------------------------------------------------------------------------------
-
-The same object can be loaded more than once within a single query.  Given
-``A.b`` referring to ``B``, ``B.a`` referring back to ``A``, and ``A.c``
-referring to ``C``, the query below loads ``A`` twice: once as the entity
-being selected, and again underneath ``A.b -> B.a``::
-
-    stmt = select(A).options(
-        joinedload(A.b).joinedload(B.a).raiseload("*"),
-        joinedload(A.c),
-    )
-
-    a = session.scalars(stmt).unique().one()
-
-SQLAlchemy remembers which of those two paths an object was loaded under, and
-applies the loader options from that path whenever more SQL is emitted for the
-object later on::
-
-    session.expire(a)
-
-    a.value  # refresh, emitting SELECT for the "a" row
-
-    a.c  # 2.0: raises InvalidRequestError; 2.1: loads normally
-
-In 2.0 it was difficult to predict which of the paths would be the one
-remembered, as it varied with the loader strategy in use, so the
-``raiseload("*")`` written for ``A.b -> B.a`` could end up applied to ``a``
-itself.  In 2.1 the shallowest path is favored, a deterministic rule rather
-than one based on which loader strategy within the query happened to see the
-object first.
-
-This applies to all forms of :term:`lazy loading`, such as when expired
-attributes are unexpired, deferred columns are loaded, or unloaded
-relationships are loaded::
-
-    stmt = select(A).options(
-        joinedload(A.b).joinedload(B.a).lazyload(A.c).joinedload(C.d),
-    )
-
-    a = session.scalars(stmt).unique().one()
-
-    a.c  # 2.0: SELECT from "c" with a JOIN to "d"; 2.1: SELECT from "c"
-
-Code that relies on complex interactions of overlapping paths may need
-adjustment, as the behavior should now be consistent across the different
-kinds of loader option.
-
-:ticket:`13507`
 
 
 Core - Behavioral Changes and Improvements

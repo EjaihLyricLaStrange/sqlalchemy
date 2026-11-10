@@ -45,7 +45,7 @@ Discussions = "https://github.com/sqlalchemy/sqlalchemy/discussions"
 [project.optional-dependencies]
 asyncio = ["greenlet>=1"]
 mypy = [
-    "mypy >= 2.3",
+    "mypy >= 2.4",
     "types-greenlet >= 2",
 ]
 mssql = ["pyodbc"]
@@ -87,19 +87,6 @@ aiosqlite = [
     "aiosqlite",
 ]
 sqlcipher = ["sqlcipher3_binary"]
-
-# legacy pre-pep-685 names. These are ignored by pip >= 23.3.0
-mssql_pymssql = ["sqlalchemy[mssql-pymssql]"]
-mssql_pyodbc = ["sqlalchemy[mssql-pyodbc]"]
-mysql_connector = ["sqlalchemy[mysql-connector]"]
-mariadb_connector = ["sqlalchemy[mariadb-connector]"]
-oracle_oracledb = ["sqlalchemy[oracle-oracledb]"]
-postgresql_pg8000 = ["sqlalchemy[postgresql-pg8000]"]
-postgresql_asyncpg = ["sqlalchemy[postgresql-asyncpg]"]
-postgresql_psycopg2binary = ["sqlalchemy[postgresql-psycopg2binary]"]
-postgresql_psycopg2cffi = ["sqlalchemy[postgresql-psycopg2cffi]"]
-postgresql_psycopg = ["sqlalchemy[postgresql-psycopg]"]
-postgresql_psycopgbinary = ["sqlalchemy[postgresql-psycopgbinary]"]
 
 [dependency-groups]
 tests = [
@@ -185,7 +172,7 @@ lint = [
     "flake8-rst-docstrings",
     "pydocstyle<4.0.0",
     "pygments",
-    "black==26.3.1",
+    "black==26.10.1",
     "slotscheck>=0.17.0",
     "zimports>=0.7.0",  # required by generate_tuple_map_overloads
 ]

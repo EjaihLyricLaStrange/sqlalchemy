@@ -29,6 +29,7 @@ from .descriptor_props import Synonym
 from .interfaces import _AttributeOptions
 from .properties import MappedColumn
 from .properties import MappedSQLExpression
+from .properties import UnmappedColumn
 from .query import AliasOption
 from .relationships import _RelationshipArgumentType
 from .relationships import _RelationshipBackPopulatesArgument
@@ -395,6 +396,139 @@ def mapped_column(
     )
 
 
+def unmapped_column(
+    __name_pos: Optional[
+        Union[str, _TypeEngineArgument[Any], SchemaEventTarget]
+    ] = None,
+    __type_pos: Optional[
+        Union[_TypeEngineArgument[Any], SchemaEventTarget]
+    ] = None,
+    /,
+    *args: SchemaEventTarget,
+    init: Literal[False] = False,
+    nullable: Optional[
+        Union[bool, Literal[SchemaConst.NULL_UNSPECIFIED]]
+    ] = SchemaConst.NULL_UNSPECIFIED,
+    primary_key: Optional[bool] = False,
+    autoincrement: _AutoIncrementType = "auto",
+    use_existing_column: bool = False,
+    name: Optional[str] = None,
+    type_: Optional[_TypeEngineArgument[Any]] = None,
+    index: Optional[bool] = None,
+    unique: Optional[bool] = None,
+    info: Optional[_InfoType] = None,
+    default: Optional[Any] = _NoArg.NO_ARG,
+    insert_default: Optional[Any] = _NoArg.NO_ARG,
+    onupdate: Optional[Any] = None,
+    server_default: Optional[_ServerDefaultArgument] = None,
+    server_onupdate: Optional[_ServerOnUpdateArgument] = None,
+    quote: Optional[bool] = None,
+    system: bool = False,
+    comment: Optional[str] = None,
+    sort_order: Union[_NoArg, int] = _NoArg.NO_ARG,
+    **kw: Any,
+) -> UnmappedColumn[Any]:
+    r"""declare a :class:`_schema.Column` that is part of the
+    :class:`_schema.Table` for a :ref:`Declarative Table
+    <orm_declarative_table>` mapping, but which is not mapped by the ORM.
+
+    :func:`_orm.unmapped_column` is used with the :class:`_orm.Unmapped`
+    annotation::
+
+        class User(Base):
+            __tablename__ = "user"
+
+            id: Mapped[int] = mapped_column(primary_key=True)
+            name: Mapped[str]
+
+            legacy_name: Unmapped[str | None] = unmapped_column()
+
+    The resulting :class:`_schema.Column` is added to the
+    :class:`_schema.Table` in the same way as one produced by
+    :func:`_orm.mapped_column`, deriving its type and nullability from the
+    annotation, so that the column is present in DDL as well as for schema
+    comparison tools such as Alembic autogenerate.  However, the column is
+    excluded from the mapping, the attribute is removed from the class, and
+    when using :ref:`orm_declarative_native_dataclasses` it is not part of
+    the dataclass.
+
+    A bare ``Unmapped[]`` annotation with no right-hand side is equivalent
+    to ``unmapped_column()`` with no arguments; however, see the note at
+    :class:`_orm.Unmapped` regarding typing tools and dataclasses.
+
+    As the attribute is not part of the Python model, ORM and dataclass
+    oriented arguments of :func:`_orm.mapped_column`, such as
+    ``default_factory`` and ``deferred``, are not part of
+    :func:`_orm.unmapped_column`.
+
+    .. versionadded:: 2.1.5
+
+    .. seealso::
+
+        :ref:`orm_declarative_unmapped_column`
+
+    :param __name: String name to give to the :class:`_schema.Column`;
+     defaults to the attribute name.
+    :param __type: :class:`_types.TypeEngine` type or instance for the
+     :class:`_schema.Column`; if omitted, it is derived from the
+     annotation, or from a :class:`_schema.ForeignKey` if present.
+    :param \*args: Additional positional arguments such as
+     :class:`_schema.ForeignKey` and :class:`_schema.CheckConstraint`,
+     passed through to the :class:`_schema.Column`.
+    :param init: Always ``False``; this parameter is present so that
+     :pep:`681` typing tools omit the attribute from the ``__init__()``
+     method of :ref:`ORM mapped dataclasses
+     <orm_declarative_native_dataclasses>`.
+    :param nullable: whether the column is "NULL" or "NOT NULL"; if omitted,
+     derived from the annotation as with :func:`_orm.mapped_column`.
+    :param primary_key: indicates the :class:`_schema.Column` is part of the
+     table's primary key.  As the mapper requires that its primary key
+     columns be mapped, the columns that the mapper should use for the
+     identity of the class must then be indicated using the
+     :paramref:`_orm.Mapper.primary_key` parameter; see
+     :ref:`orm_declarative_unmapped_column` for an example.
+    :param autoincrement: Passed directly to the
+     :paramref:`_schema.Column.autoincrement` parameter.
+    :param use_existing_column: see
+     :paramref:`_orm.mapped_column.use_existing_column`.
+    :param default: Passed directly to the :paramref:`_schema.Column.default`
+     parameter.  As the attribute is not part of a dataclass, this is
+     strictly a Core column default.
+    :param insert_default: synonym for
+     :paramref:`_orm.unmapped_column.default`.
+    :param sort_order: see :paramref:`_orm.mapped_column.sort_order`.
+    :param \**kw: All remaining keyword arguments are passed through to the
+     constructor for the :class:`_schema.Column`, including dialect-specific
+     arguments.
+
+    """
+
+    return UnmappedColumn(
+        __name_pos,
+        __type_pos,
+        *args,
+        name=name,
+        type_=type_,
+        default=default,
+        insert_default=insert_default,
+        index=index,
+        unique=unique,
+        info=info,
+        nullable=nullable,
+        primary_key=primary_key,
+        autoincrement=autoincrement,
+        onupdate=onupdate,
+        server_default=server_default,
+        server_onupdate=server_onupdate,
+        use_existing_column=use_existing_column,
+        quote=quote,
+        comment=comment,
+        system=system,
+        sort_order=sort_order,
+        **kw,
+    )
+
+
 def orm_insert_sentinel(
     name: Optional[str] = None,
     type_: Optional[_TypeEngineArgument[Any]] = None,
@@ -642,6 +776,7 @@ def composite(
     return_none_on: Union[_NoArg, None, Callable[..., bool]] = _NoArg.NO_ARG,
     comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
     active_history: bool = False,
+    column_template: Optional[str] = None,
     init: Union[_NoArg, bool] = _NoArg.NO_ARG,
     repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
     default: Optional[Any] = _NoArg.NO_ARG,
@@ -667,6 +802,7 @@ def composite(
     return_none_on: Union[_NoArg, None, Callable[..., bool]] = _NoArg.NO_ARG,
     comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
     active_history: bool = False,
+    column_template: Optional[str] = None,
     init: Union[_NoArg, bool] = _NoArg.NO_ARG,
     repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
     default: Optional[Any] = _NoArg.NO_ARG,
@@ -691,6 +827,7 @@ def composite(
     return_none_on: Union[_NoArg, None, Callable[..., bool]] = _NoArg.NO_ARG,
     comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
     active_history: bool = False,
+    column_template: Optional[str] = None,
     init: Union[_NoArg, bool] = _NoArg.NO_ARG,
     repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
     default: Optional[Any] = _NoArg.NO_ARG,
@@ -716,6 +853,7 @@ def composite(
     return_none_on: Union[_NoArg, None, Callable[..., bool]] = _NoArg.NO_ARG,
     comparator_factory: Optional[Type[Composite.Comparator[_T]]] = None,
     active_history: bool = False,
+    column_template: Optional[str] = None,
     init: Union[_NoArg, bool] = _NoArg.NO_ARG,
     repr: Union[_NoArg, bool] = _NoArg.NO_ARG,  # noqa: A002
     default: Optional[Any] = _NoArg.NO_ARG,
@@ -785,6 +923,18 @@ def composite(
       :class:`.Composite.Comparator` which provides custom SQL
       clause generation for comparison operations.
 
+    :param column_template: A string template such as ``"person_%s"``,
+     containing exactly one ``%s`` placeholder, that's used to generate
+     column names for fields of a dataclass :paramref:`.composite.class_`
+     that don't otherwise have an explicit name.  Only supported for
+     dataclass-based composite classes.
+
+     .. seealso::
+
+        :ref:`composite_column_template`
+
+     .. versionadded:: 2.1
+
     :param doc:
       optional string that will be applied as the doc on the
       class-bound descriptor.
@@ -852,6 +1002,7 @@ def composite(
         raiseload=raiseload,
         comparator_factory=comparator_factory,
         active_history=active_history,
+        column_template=column_template,
         info=info,
         doc=doc,
     )
